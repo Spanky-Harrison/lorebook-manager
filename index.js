@@ -77,6 +77,8 @@ const dom = {
 let currentEditor;
 let editorRenderToken = null;
 let worldInfoPresetPlaceholder;
+const localBookRevisions = Object.create(null);
+const localSaveRevision = Symbol('stwid.localSaveRevision');
 
 const activationBlock = document.querySelector('#wiActivationSettings');
 const activationBlockParent = activationBlock.parentElement;
@@ -89,6 +91,22 @@ const entryState = function(entry) {
     } else {
         return 'normal';
     }
+};
+const markLocalBookRevision = (name)=>{
+    if (!name) return 0;
+    localBookRevisions[name] = (localBookRevisions[name] ?? 0) + 1;
+    return localBookRevisions[name];
+};
+const getLocalBookRevision = (name)=>localBookRevisions[name] ?? 0;
+const saveManagedWorldInfo = async(name, data, immediately = true)=>{
+    const revision = markLocalBookRevision(name);
+    if (data && typeof data == 'object') {
+        Object.defineProperty(data, localSaveRevision, {
+            value: revision,
+            configurable: true,
+        });
+    }
+    await saveWorldInfo(name, data, immediately);
 };
 const normalizeFolderName = (name)=>String(name ?? '').trim();
 const getFolderSettings = ()=>{
@@ -226,6 +244,89 @@ const setEntryFolder = (worldName, data, entry, folderName)=>{
         delete entry.extensions;
     }
 };
+const applyStoredFolderData = (worldName, data)=>{
+    if (!worldName || !data?.entries) return false;
+    let changed = false;
+    for (const entry of Object.values(data.entries)) {
+        if (entry?.uid === undefined || entry?.uid === null) continue;
+        const storedFolder = getStoredEntryFolder(worldName, entry.uid);
+        if (storedFolder === null) continue;
+        const embeddedFolder = normalizeFolderName(entry?.extensions?.[FOLDER_EXTENSION_KEY]);
+        if (storedFolder) {
+            if (embeddedFolder == storedFolder) continue;
+            entry.extensions = entry.extensions && typeof entry.extensions == 'object' ? entry.extensions : {};
+            entry.extensions[FOLDER_EXTENSION_KEY] = storedFolder;
+            setWIOriginalDataValue(data, entry.uid, `extensions.${FOLDER_EXTENSION_KEY}`, storedFolder);
+            changed = true;
+            continue;
+        }
+        if (!embeddedFolder) continue;
+        delete entry.extensions[FOLDER_EXTENSION_KEY];
+        if (Object.keys(entry.extensions).length == 0) delete entry.extensions;
+        deleteWIOriginalDataPath(data, entry.uid, `extensions.${FOLDER_EXTENSION_KEY}`);
+        changed = true;
+    }
+    return changed;
+};
+const getEmbeddedFolderStats = (data)=>{
+    const folders = new Set();
+    let assignmentCount = 0;
+    for (const entry of Object.values(data?.entries ?? {})) {
+        const folderName = normalizeFolderName(entry?.extensions?.[FOLDER_EXTENSION_KEY]);
+        if (!folderName) continue;
+        folders.add(folderName);
+        assignmentCount++;
+    }
+    return { folderCount:folders.size, assignmentCount };
+};
+const removeEmbeddedFolderData = (data)=>{
+    for (const entry of Object.values(data?.entries ?? {})) {
+        if (!entry?.extensions || typeof entry.extensions != 'object') continue;
+        delete entry.extensions[FOLDER_EXTENSION_KEY];
+        if (Object.keys(entry.extensions).length == 0) delete entry.extensions;
+    }
+    if (Array.isArray(data?.originalData?.entries)) {
+        for (const entry of data.originalData.entries) {
+            if (!entry?.extensions || typeof entry.extensions != 'object') continue;
+            delete entry.extensions[FOLDER_EXTENSION_KEY];
+            if (Object.keys(entry.extensions).length == 0) delete entry.extensions;
+        }
+    }
+};
+const askFolderExportChoice = async(stats)=>{
+    const result = await Popup.show.confirm(
+        'Export Lorebook Folder data?',
+        `
+            <div>This lorebook has ${stats.folderCount} folder${stats.folderCount == 1 ? '' : 's'} and ${stats.assignmentCount} categorized entr${stats.assignmentCount == 1 ? 'y' : 'ies'}.</div>
+            <br>
+            <div>Keeping it lets other Lorebook Manager/Lorebook Folders users restore folders. Exporting without it keeps the normal SillyTavern lorebook entries, but removes the folder metadata for people who do not use these extensions.</div>
+        `,
+        {
+            okButton:'Export without folders',
+            cancelButton:'Keep folder data',
+        },
+    );
+    if (result === POPUP_RESULT.CANCELLED) return null;
+    return result === POPUP_RESULT.AFFIRMATIVE ? 'strip' : 'keep';
+};
+const exportBookWithFolderChoice = async(worldName)=>{
+    await ensureBookLoaded(worldName);
+    const exportData = structuredClone({ entries:cache[worldName].entries });
+    applyStoredFolderData(worldName, exportData);
+    const stats = getEmbeddedFolderStats(exportData);
+    if (stats.assignmentCount > 0) {
+        const choice = await askFolderExportChoice(stats);
+        if (choice === null) return;
+        if (choice == 'strip') {
+            removeEmbeddedFolderData(exportData);
+        }
+    }
+    download(JSON.stringify(exportData), `${worldName}.json`, 'application/json');
+};
+const closeStwidBlockers = ()=>{
+    document.querySelectorAll('.stwid--blocker').forEach(blocker=>blocker.remove());
+    document.querySelectorAll('.stwid--menuTrigger, .stwid--folderAssign').forEach(anchor=>anchor.style.anchorName = '');
+};
 const promptForFolderName = async(title, defaultValue = '')=>{
     const value = await Popup.show.input(title, 'Folder name:', defaultValue, {
         okButton: 'Save',
@@ -269,7 +370,8 @@ const renameFolder = async(worldName, oldName)=>{
     delete state.collapsed[oldName];
     dedupeFolders(state);
     saveSettingsDebounced();
-    await saveWorldInfo(worldName, data, true);
+    await saveManagedWorldInfo(worldName, data, true);
+    await updateWIChange(worldName, data);
     regroupBookEntries(worldName);
 };
 const deleteFolder = async(worldName, folderName)=>{
@@ -290,7 +392,8 @@ const deleteFolder = async(worldName, folderName)=>{
     delete state.collapsed[folderName];
     dedupeFolders(state);
     saveSettingsDebounced();
-    await saveWorldInfo(worldName, data, true);
+    await saveManagedWorldInfo(worldName, data, true);
+    await updateWIChange(worldName, data);
     regroupBookEntries(worldName);
 };
 const moveFolder = (worldName, folderName, direction)=>{
@@ -482,9 +585,9 @@ const assignSelectedEntriesToFolder = async(worldName, folderName, isCopy = fals
                 }
             }
         }
-        await saveWorldInfo(worldName, dstBook, true);
+        await saveManagedWorldInfo(worldName, dstBook, true);
         if (selectFrom != worldName) {
-            await saveWorldInfo(selectFrom, srcBook, true);
+            await saveManagedWorldInfo(selectFrom, srcBook, true);
             updateWIChange(selectFrom, srcBook);
         }
         updateWIChange(worldName, dstBook);
@@ -495,7 +598,8 @@ const assignSelectedEntriesToFolder = async(worldName, folderName, isCopy = fals
             if (!entry) continue;
             setEntryFolder(worldName, data, entry, targetFolder);
         }
-        await saveWorldInfo(worldName, data, true);
+        await saveManagedWorldInfo(worldName, data, true);
+        await updateWIChange(worldName, data);
     }
 };
 const transferEntryToBook = async(srcName, uid, dstName, isCopy = false)=>{
@@ -524,14 +628,14 @@ const transferEntryToBook = async(srcName, uid, dstName, isCopy = false)=>{
     delete oData.uid;
     const dstEntry = createWorldInfoEntry(null, dstBook);
     Object.assign(dstEntry, oData);
-    await saveWorldInfo(dstName, dstBook, true);
+    await saveManagedWorldInfo(dstName, dstBook, true);
 
     if (!isCopy) {
         const deleted = await deleteWorldInfoEntry(srcBook, uid, { silent:true });
         if (deleted) {
             deleteWIOriginalDataValue(srcBook, uid);
             delete getWorldFolderState(srcName).entries[String(uid)];
-            await saveWorldInfo(srcName, srcBook, true);
+            await saveManagedWorldInfo(srcName, srcBook, true);
             updateWIChange(srcName, srcBook);
         }
     }
@@ -786,9 +890,11 @@ const assignEntryFolder = async(worldName, uid, folderName)=>{
     if (!entry) return;
     setEntryFolder(worldName, data, entry, folderName);
     if (folderName) ensureKnownFolder(worldName, folderName);
-    await saveWorldInfo(worldName, data, true);
+    await saveManagedWorldInfo(worldName, data, true);
+    await updateWIChange(worldName, data);
 };
 const manageFolders = async(worldName)=>{
+    closeStwidBlockers();
     const data = await loadWorldInfo(worldName);
     if (!data?.entries) return;
     const folders = getFolderNames(worldName, data);
@@ -823,32 +929,44 @@ const manageFolders = async(worldName)=>{
         }
         const up = createManageFolderButton('fa-arrow-up', 'Move up'); {
             up.disabled = index == 0;
-            up.addEventListener('click', async()=>{
+            up.addEventListener('click', async(evt)=>{
+                evt.preventDefault();
+                evt.stopPropagation();
                 await popup?.completeCancelled();
                 moveFolder(worldName, folderName, -1);
+                await manageFolders(worldName);
             });
             row.append(up);
         }
         const down = createManageFolderButton('fa-arrow-down', 'Move down'); {
             down.disabled = index == folders.length - 1;
-            down.addEventListener('click', async()=>{
+            down.addEventListener('click', async(evt)=>{
+                evt.preventDefault();
+                evt.stopPropagation();
                 await popup?.completeCancelled();
                 moveFolder(worldName, folderName, 1);
+                await manageFolders(worldName);
             });
             row.append(down);
         }
         const rename = createManageFolderButton('fa-pencil', 'Rename'); {
-            rename.addEventListener('click', async()=>{
+            rename.addEventListener('click', async(evt)=>{
+                evt.preventDefault();
+                evt.stopPropagation();
                 await popup?.completeCancelled();
                 await renameFolder(worldName, folderName);
+                await manageFolders(worldName);
             });
             row.append(rename);
         }
         const remove = createManageFolderButton('fa-trash-can', 'Delete'); {
             remove.classList.add('stwid--folderManageDelete');
-            remove.addEventListener('click', async()=>{
+            remove.addEventListener('click', async(evt)=>{
+                evt.preventDefault();
+                evt.stopPropagation();
                 await popup?.completeCancelled();
                 await deleteFolder(worldName, folderName);
+                await manageFolders(worldName);
             });
             row.append(remove);
         }
@@ -870,6 +988,7 @@ const manageFolders = async(worldName)=>{
     popup = new Popup(wrapper, POPUP_TYPE.TEXT, null, {
         okButton:'Close',
         cancelButton:false,
+        wider:true,
         allowVerticalScrolling:true,
     });
     await popup.show();
@@ -895,8 +1014,13 @@ const updateSettingsChange = ()=>{
 let updateWIChangeStarted = Promise.withResolvers();
 /**@type {PromiseWithResolvers<any>} */
 let updateWIChangeFinished;
-const updateWIChange = async(name = null, data = null)=>{
+const updateWIChange = async(name = null, data = null, eventRevision = null)=>{
     console.log('[STWID]', '[UPDATE-WI]', name, data);
+    eventRevision ??= data?.[localSaveRevision] ?? null;
+    if (name && eventRevision !== null && cache[name]?.loaded && getLocalBookRevision(name) > eventRevision) {
+        console.debug('[STWID]', '[UPDATE-WI]', 'Skipping stale update for', name);
+        return;
+    }
     updateWIChangeFinished = Promise.withResolvers();
     updateWIChangeStarted.resolve();
     // removed books
@@ -932,6 +1056,9 @@ const updateWIChange = async(name = null, data = null)=>{
         const world = { entries:{} };
         for (const [k,v] of Object.entries(data.entries)) {
             world.entries[k] = structuredClone(v);
+        }
+        if (currentEditor?.name == name && dom.editor.contains(document.activeElement) && world.entries[currentEditor.uid] && cache[name].entries[currentEditor.uid]) {
+            world.entries[currentEditor.uid] = structuredClone(cache[name].entries[currentEditor.uid]);
         }
         let hasStructureChange = false;
         // removed entries
@@ -1027,7 +1154,7 @@ const updateWIChange = async(name = null, data = null)=>{
 };
 const updateWIChangeDebounced = debounce(updateWIChange);
 
-eventSource.on(event_types.WORLDINFO_UPDATED, (name, world)=>updateWIChangeDebounced(name, world));
+eventSource.on(event_types.WORLDINFO_UPDATED, (name, world)=>updateWIChangeDebounced(name, world, world?.[localSaveRevision] ?? null));
 eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, ()=>updateSettingsChange());
 
 
@@ -1155,7 +1282,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
                     delete oData.uid;
                     const dstEntry = createWorldInfoEntry(null, dstBook);
                     Object.assign(dstEntry, oData);
-                    await saveWorldInfo(name, dstBook, true);
+                    await saveManagedWorldInfo(name, dstBook, true);
                     if (!isCopy) {
                         const deleted = await deleteWorldInfoEntry(srcBook, uid, { silent:true });
                         if (deleted) {
@@ -1164,7 +1291,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
                     }
                 }
                 if (selectFrom != name) {
-                    await saveWorldInfo(selectFrom, srcBook, true);
+                    await saveManagedWorldInfo(selectFrom, srcBook, true);
                     updateWIChange(selectFrom, srcBook);
                 }
                 updateWIChange(name, dstBook);
@@ -1222,7 +1349,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
                         await renderEntry(newEntry, name);
                         regroupBookEntries(name);
                         cache[name].dom.entry[newEntry.uid].root.click();
-                        await saveWorldInfo(name, data, true);
+                        await saveManagedWorldInfo(name, data, true);
                     });
                     actions.append(add);
                 }
@@ -1350,8 +1477,10 @@ const renderBook = async(name, before = null, bookData = null)=>{
                                     exp.classList.add('stwid--item');
                                     exp.classList.add('stwid--export');
                                     exp.addEventListener('click', async(evt)=>{
-                                        await ensureBookLoaded(name);
-                                        download(JSON.stringify({ entries:cache[name].entries }), name, 'application/json');
+                                        evt.preventDefault();
+                                        evt.stopPropagation();
+                                        closeStwidBlockers();
+                                        await exportBookWithFolderChoice(name);
                                     });
                                     const i = document.createElement('i'); {
                                         i.classList.add('stwid--icon');
@@ -1577,7 +1706,7 @@ const renderEntry = async(e, name, before = null)=>{
                     const dis = isEnabled.classList.toggle('fa-toggle-off');
                     isEnabled.classList.toggle('fa-toggle-on');
                     cache[name].entries[e.uid].disable = dis;
-                    await saveWorldInfo(name, { entries:cache[name].entries }, true);
+                    await saveManagedWorldInfo(name, { entries:cache[name].entries }, true);
                 });
                 status.append(isEnabled);
             }
@@ -1604,7 +1733,7 @@ const renderEntry = async(e, name, before = null)=>{
                             break;
                         }
                     }
-                    await saveWorldInfo(name, { entries:cache[name].entries }, true);
+                    await saveManagedWorldInfo(name, { entries:cache[name].entries }, true);
                 });
                 status.append(strat);
             }
@@ -1749,7 +1878,7 @@ const addDrawer = ()=>{
                             deleteWIOriginalDataValue(srcBook, uid);
                         }
                     }
-                    await saveWorldInfo(selectFrom, srcBook, true);
+                    await saveManagedWorldInfo(selectFrom, srcBook, true);
                     updateWIChange(selectFrom, srcBook);
                     selectEnd();
                     break;
@@ -1985,7 +2114,7 @@ const addDrawer = ()=>{
                                                     order += step;
                                                 }
                                                 for (const book of books) {
-                                                    await saveWorldInfo(book, { entries:cache[book].entries }, true);
+                                                    await saveManagedWorldInfo(book, { entries:cache[book].entries }, true);
                                                 }
                                             });
                                             actions.append(apply);
@@ -2139,7 +2268,7 @@ const addDrawer = ()=>{
                                                                     cache[e.book].dom.entry[e.data.uid].isEnabled.classList.toggle('fa-toggle-off');
                                                                     cache[e.book].dom.entry[e.data.uid].isEnabled.classList.toggle('fa-toggle-on');
                                                                     cache[e.book].entries[e.data.uid].disable = dis;
-                                                                    await saveWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
                                                                 });
                                                                 active.append(isEnabled);
                                                             }
@@ -2199,7 +2328,7 @@ const addDrawer = ()=>{
                                                                             break;
                                                                         }
                                                                     }
-                                                                    await saveWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
                                                                 });
                                                                 strategy.append(strat);
                                                             }
@@ -2213,7 +2342,7 @@ const addDrawer = ()=>{
                                                                     const value = pos.value;
                                                                     cache[e.book].dom.entry[e.data.uid].position.value = value;
                                                                     cache[e.book].entries[e.data.uid].position = value;
-                                                                    await saveWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
                                                                 });
                                                                 position.append(pos);
                                                             }
@@ -2393,6 +2522,12 @@ const addDrawer = ()=>{
             const editor = document.createElement('div'); {
                 dom.editor = editor;
                 editor.classList.add('stwid--editor');
+                editor.addEventListener('input', ()=>{
+                    if (currentEditor?.name) markLocalBookRevision(currentEditor.name);
+                }, true);
+                editor.addEventListener('change', ()=>{
+                    if (currentEditor?.name) markLocalBookRevision(currentEditor.name);
+                }, true);
                 editor.addEventListener('click', async(evt)=>{
                     const transferBtn = /**@type {HTMLElement}*/(evt.target)?.closest?.('.stwip--transfer');
                     if (!transferBtn || !currentEditor) return;
