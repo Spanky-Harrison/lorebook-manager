@@ -278,21 +278,42 @@ export function deleteBookFolder(state, worldNames, folderId) {
  * @returns {boolean}
  */
 export function moveBook(state, worldNames, bookName, targetFolderId, beforeBookName = null) {
+    return moveBooks(state, worldNames, [bookName], targetFolderId, beforeBookName);
+}
+
+/**
+ * Move lorebooks together, keeping `bookNames` order. `beforeBookName` inserts
+ * the group before that book in the destination; null appends. A before-book
+ * that is part of the group is ignored so the drop stays on a stationary book.
+ * @returns {boolean}
+ */
+export function moveBooks(state, worldNames, bookNames, targetFolderId, beforeBookName = null) {
     const names = uniqueNames(worldNames);
-    if (!names.includes(bookName)) return false;
+    const moving = [];
+    const movingSet = new Set();
+    for (const bookName of bookNames ?? []) {
+        if (!names.includes(bookName) || movingSet.has(bookName)) continue;
+        moving.push(bookName);
+        movingSet.add(bookName);
+    }
+    if (!moving.length) return false;
     if (targetFolderId !== null && !state.folders.some(folder=>folder.id == targetFolderId)) return false;
     reconcileBookFolders(state, names);
-    const sourceFolderId = getBookFolderId(state, bookName);
-    const sourceNames = getFolderBooks(state, names, sourceFolderId).filter(name=>name != bookName);
-    const destinationNames = (sourceFolderId === targetFolderId ? sourceNames : getFolderBooks(state, names, targetFolderId).filter(name=>name != bookName)).slice();
+    const sourceFolders = new Set(moving.map(bookName=>getBookFolderId(state, bookName)));
+    let anchor = beforeBookName;
+    if (typeof anchor == 'string' && movingSet.has(anchor)) anchor = null;
+    const destinationNames = getFolderBooks(state, names, targetFolderId).filter(bookName=>!movingSet.has(bookName));
     let index = destinationNames.length;
-    if (typeof beforeBookName == 'string' && beforeBookName != bookName) {
-        const beforeIndex = destinationNames.indexOf(beforeBookName);
+    if (typeof anchor == 'string') {
+        const beforeIndex = destinationNames.indexOf(anchor);
         if (beforeIndex >= 0) index = beforeIndex;
     }
-    destinationNames.splice(index, 0, bookName);
+    destinationNames.splice(index, 0, ...moving);
     reindexBooks(state, destinationNames, targetFolderId);
-    if (sourceFolderId !== targetFolderId) reindexBooks(state, sourceNames, sourceFolderId);
+    for (const sourceFolderId of sourceFolders) {
+        if (sourceFolderId === targetFolderId) continue;
+        reindexBooks(state, getFolderBooks(state, names, sourceFolderId), sourceFolderId);
+    }
     return true;
 }
 
