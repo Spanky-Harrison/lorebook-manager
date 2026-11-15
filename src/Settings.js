@@ -1,5 +1,6 @@
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { extension_settings } from '../../../../extensions.js';
+import { normalizeBookFolderState, serializeBookFolderState } from './BookFolders.js';
 
 
 /** @readonly */
@@ -32,9 +33,17 @@ export class Settings {
     sortLogic = SORT.ALPHABETICAL;
     /**@type {SORT_DIRECTION} */
     sortDirection = SORT_DIRECTION.ASCENDING;
+    /**
+     * Top-level lorebook folders. Keyed by lorebook name inside `books`.
+     * This is extension state only and is never written into a lorebook file.
+     * @type {ReturnType<typeof normalizeBookFolderState>}
+     */
+    bookFolders = null;
 
     constructor() {
-        Object.assign(this, extension_settings.lorebookManager ?? extension_settings.wordInfoDrawer ?? {});
+        const saved = extension_settings.lorebookManager ?? extension_settings.wordInfoDrawer ?? {};
+        Object.assign(this, saved);
+        this.bookFolders = normalizeBookFolderState(saved.bookFolders);
         extension_settings.lorebookManager = this;
     }
 
@@ -42,6 +51,7 @@ export class Settings {
         return {
             sortLogic: this.sortLogic,
             sortDirection: this.sortDirection,
+            bookFolders: serializeBookFolderState(this.bookFolders),
         };
     }
 

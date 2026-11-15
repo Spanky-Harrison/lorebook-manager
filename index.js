@@ -7,6 +7,7 @@ import { renderTemplateAsync } from '../../../templates.js';
 import { debounce, debounceAsync, delay, download, getSortableDelay, isTrueBoolean, uuidv4 } from '../../../utils.js';
 import { createNewWorldInfo, createWorldInfoEntry, deleteWIOriginalDataValue, deleteWorldInfoEntry, getFreeWorldName, getWorldEntry, loadWorldInfo, onWorldInfoChange, saveWorldInfo, selected_world_info, setWIOriginalDataValue, world_info, world_names } from '../../../world-info.js';
 import { Settings, SORT, SORT_DIRECTION } from './src/Settings.js';
+import { createBookFolder, deleteBookFolder, getBookFolderId, getFolderBooks, getSortedBookFolders, getUnfiledBooks, moveBook, moveBookFolder, reconcileBookFolders, renameBookFolder, resolveBookDrop, setBookFolderCollapsed } from './src/BookFolders.js';
 
 const NAME = new URL(import.meta.url).pathname.split('/').at(-2);
 const DISPLAY_NAME = 'Lorebook Manager';
@@ -1002,6 +1003,367 @@ const createManageFolderButton = (iconClass, title)=>{
     button.title = title;
     return button;
 };
+/** @type {string|null} Lorebook currently being dragged between top-level folders */
+let draggingBookName = null;
+/** @type {Map<string, {root:HTMLElement, header:HTMLElement, body:HTMLElement, label:HTMLElement, count:HTMLElement, up?:HTMLButtonElement, down?:HTMLButtonElement}>} */
+const bookFolderShells = new Map();
+const UNFILED_BOOK_FOLDER_KEY = '';
+const bookFolderWarning = (reason)=>{
+    if (reason == 'reserved') toastr.warning('That folder name is reserved.', DISPLAY_NAME);
+    else if (reason == 'duplicate') toastr.warning('A folder with that name already exists.', DISPLAY_NAME);
+};
+const promptForBookFolderName = async(title, defaultValue = '')=>{
+    const value = await Popup.show.input(title, 'Folder name:', defaultValue, {
+        okButton: 'Save',
+        cancelButton: 'Cancel',
+        placeholder: 'Folder name',
+    });
+    if (typeof value != 'string') return null;
+    const name = value.trim();
+    return name || null;
+};
+const currentBookNames = ()=>Array.isArray(world_names) ? [...world_names] : [];
+const clearBookDragHints = ()=>{
+    dom.books?.querySelectorAll('.stwid--dropBefore, .stwid--dropAfter, .stwid--bookFolderDropTarget').forEach(el=>{
+        el.classList.remove('stwid--dropBefore', 'stwid--dropAfter', 'stwid--bookFolderDropTarget');
+    });
+};
+const updateBookFolderAssignButton = (name)=>{
+    const button = cache[name]?.dom?.folderAssign;
+    if (!button) return;
+    const state = Settings.instance.bookFolders;
+    const folderId = getBookFolderId(state, name);
+    const folder = state.folders.find(item=>item.id == folderId);
+    button.classList.toggle('stwid--bookFolderAssigned', Boolean(folder));
+    button.title = folder ? `Folder: ${folder.name}` : 'Move lorebook to folder';
+};
+const createBookFolderAction = (iconClass, title)=>{
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.classList.add('stwid--bookFolderAction');
+    button.classList.add('fa-solid', 'fa-fw', iconClass);
+    button.title = title;
+    return button;
+};
+const layoutBookFolders = ()=>{
+    if (!dom.books) return;
+    const state = Settings.instance.bookFolders;
+    // world_names is undefined until SillyTavern finishes settings init. Reconciling
+    // against that would treat every lorebook as deleted and wipe the folder map.
+    const namesKnown = Array.isArray(world_names);
+    const names = namesKnown ? [...world_names] : [];
+    if (namesKnown && reconcileBookFolders(state, names)) Settings.instance.save();
+    const folders = getSortedBookFolders(state);
+    dom.books.classList.toggle('stwid--hasBookFolders', folders.length > 0);
+    const seen = new Set();
+    const fragment = document.createDocumentFragment();
+    for (const folder of folders) {
+        seen.add(folder.id);
+        const shell = ensureBookFolderShell(folder.id);
+        shell.label.textContent = folder.name;
+        shell.root.classList.toggle('stwid--bookFolderCollapsed', folder.collapsed === true);
+        shell.header.title = folder.collapsed ? 'Expand folder' : 'Collapse folder';
+        const books = getFolderBooks(state, names, folder.id).map(name=>cache[name]?.dom?.root).filter(Boolean);
+        shell.count.textContent = String(books.length);
+        shell.body.replaceChildren(...books);
+        if (shell.up) shell.up.disabled = folders[0]?.id == folder.id;
+        if (shell.down) shell.down.disabled = folders.at(-1)?.id == folder.id;
+        fragment.append(shell.root);
+    }
+    for (const [id, shell] of bookFolderShells) {
+        if (id == UNFILED_BOOK_FOLDER_KEY || seen.has(id)) continue;
+        shell.root.remove();
+        bookFolderShells.delete(id);
+    }
+    const unfiled = ensureBookFolderShell(UNFILED_BOOK_FOLDER_KEY);
+    const unfiledBooks = getUnfiledBooks(state, names).map(name=>cache[name]?.dom?.root).filter(Boolean);
+    unfiled.count.textContent = String(unfiledBooks.length);
+    unfiled.body.replaceChildren(...unfiledBooks);
+    fragment.append(unfiled.root);
+    dom.books.append(fragment);
+    for (const name of names) updateBookFolderAssignButton(name);
+};
+const ensureBookFolderShell = (folderId)=>{
+    const existing = bookFolderShells.get(folderId);
+    if (existing) return existing;
+    const isUnfiled = folderId == UNFILED_BOOK_FOLDER_KEY;
+    const root = document.createElement('div');
+    root.classList.add('stwid--bookFolder');
+    if (isUnfiled) root.classList.add('stwid--bookFolderUnfiled');
+    root.dataset.folderId = folderId;
+    const header = document.createElement('div');
+    header.classList.add('stwid--bookFolderHeader');
+    if (!isUnfiled) {
+        const chevron = document.createElement('button');
+        chevron.type = 'button';
+        chevron.classList.add('stwid--bookFolderChevron');
+        chevron.classList.add('fa-solid', 'fa-fw', 'fa-circle-chevron-down');
+        chevron.tabIndex = -1;
+        header.append(chevron);
+    } else {
+        const icon = document.createElement('i');
+        icon.classList.add('stwid--bookFolderChevron');
+        icon.classList.add('fa-solid', 'fa-fw', 'fa-folder-open');
+        header.append(icon);
+    }
+    const label = document.createElement('span');
+    label.classList.add('stwid--bookFolderName');
+    label.textContent = isUnfiled ? 'Unfiled' : '';
+    header.append(label);
+    const count = document.createElement('span');
+    count.classList.add('stwid--bookFolderCount');
+    count.textContent = '0';
+    header.append(count);
+    /**@type {HTMLButtonElement|undefined} */
+    let up;
+    /**@type {HTMLButtonElement|undefined} */
+    let down;
+    if (!isUnfiled) {
+        up = createBookFolderAction('fa-arrow-up', 'Move folder up');
+        down = createBookFolderAction('fa-arrow-down', 'Move folder down');
+        const rename = createBookFolderAction('fa-pencil', 'Rename folder');
+        const remove = createBookFolderAction('fa-trash-can', 'Delete folder');
+        remove.classList.add('stwid--bookFolderDelete');
+        up.addEventListener('click', (evt)=>{
+            evt.preventDefault();
+            evt.stopPropagation();
+            if (moveBookFolder(Settings.instance.bookFolders, folderId, -1)) {
+                Settings.instance.save();
+                layoutBookFolders();
+            }
+        });
+        down.addEventListener('click', (evt)=>{
+            evt.preventDefault();
+            evt.stopPropagation();
+            if (moveBookFolder(Settings.instance.bookFolders, folderId, 1)) {
+                Settings.instance.save();
+                layoutBookFolders();
+            }
+        });
+        rename.addEventListener('click', (evt)=>{
+            evt.preventDefault();
+            evt.stopPropagation();
+            renameTopLevelBookFolder(folderId);
+        });
+        remove.addEventListener('click', (evt)=>{
+            evt.preventDefault();
+            evt.stopPropagation();
+            deleteTopLevelBookFolder(folderId);
+        });
+        header.append(up, down, rename, remove);
+        header.addEventListener('click', ()=>toggleTopLevelBookFolder(folderId));
+    } else {
+        header.title = 'Drag a lorebook here to take it out of a folder';
+    }
+    const body = document.createElement('div');
+    body.classList.add('stwid--bookFolderBody');
+    root.append(header, body);
+    const shell = { root, header, body, label, count, up, down };
+    bookFolderShells.set(folderId, shell);
+    return shell;
+};
+const toggleTopLevelBookFolder = (folderId)=>{
+    const folder = Settings.instance.bookFolders.folders.find(item=>item.id == folderId);
+    if (!folder) return;
+    setBookFolderCollapsed(Settings.instance.bookFolders, folderId, !folder.collapsed);
+    Settings.instance.save();
+    layoutBookFolders();
+};
+const renameTopLevelBookFolder = async(folderId)=>{
+    const folder = Settings.instance.bookFolders.folders.find(item=>item.id == folderId);
+    if (!folder) return;
+    const name = await promptForBookFolderName('Rename Lorebook Folder', folder.name);
+    if (!name || name == folder.name) return;
+    const result = renameBookFolder(Settings.instance.bookFolders, folderId, name);
+    if (!result.ok) {
+        bookFolderWarning(result.reason);
+        return;
+    }
+    Settings.instance.save();
+    layoutBookFolders();
+};
+const deleteTopLevelBookFolder = async(folderId)=>{
+    const folder = Settings.instance.bookFolders.folders.find(item=>item.id == folderId);
+    if (!folder) return;
+    const result = await Popup.show.confirm(
+        'Delete Lorebook Folder',
+        `Remove folder "${folder.name}"? Its lorebooks return to the unfiled list and are not deleted.`,
+        { okButton:'Delete', cancelButton:'Cancel' },
+    );
+    if (result != POPUP_RESULT.AFFIRMATIVE) return;
+    deleteBookFolder(Settings.instance.bookFolders, currentBookNames(), folderId);
+    Settings.instance.save();
+    layoutBookFolders();
+};
+const createTopLevelBookFolder = async()=>{
+    const name = await promptForBookFolderName('New Lorebook Folder');
+    if (!name) return;
+    const result = createBookFolder(Settings.instance.bookFolders, name);
+    if (!result.ok) {
+        bookFolderWarning(result.reason);
+        return;
+    }
+    Settings.instance.save();
+    layoutBookFolders();
+    bookFolderShells.get(result.folder.id)?.root.scrollIntoView({ block:'nearest' });
+};
+const assignBookToFolder = (bookName, folderId)=>{
+    if (getBookFolderId(Settings.instance.bookFolders, bookName) === folderId) return;
+    if (!moveBook(Settings.instance.bookFolders, currentBookNames(), bookName, folderId, null)) return;
+    Settings.instance.save();
+    layoutBookFolders();
+};
+const showBookFolderMenu = (anchor, bookName)=>{
+    anchor.style.anchorName = '--stwid--ctxAnchor';
+    const state = Settings.instance.bookFolders;
+    const currentId = getBookFolderId(state, bookName);
+    const current = state.folders.find(folder=>folder.id == currentId);
+    const blocker = document.createElement('div'); {
+        blocker.classList.add('stwid--blocker');
+        blocker.addEventListener('mousedown', (evt)=>evt.stopPropagation());
+        blocker.addEventListener('pointerdown', (evt)=>evt.stopPropagation());
+        blocker.addEventListener('touchstart', (evt)=>evt.stopPropagation());
+        blocker.addEventListener('click', (evt)=>{
+            evt.stopPropagation();
+            blocker.remove();
+            anchor.style.anchorName = '';
+        });
+        const menu = document.createElement('div'); {
+            menu.classList.add('stwid--menu');
+            menu.classList.add('stwid--folderMenu');
+            const title = document.createElement('div'); {
+                title.classList.add('stwid--folderMenuTitle');
+                title.textContent = current ? `Current: ${current.name}` : 'Move Lorebook';
+                menu.append(title);
+            }
+            for (const folder of getSortedBookFolders(state)) {
+                const item = createStwidMenuItem(currentId == folder.id ? 'fa-check' : 'fa-folder', folder.name, 'stwid--assignBookFolder');
+                item.addEventListener('click', ()=>{
+                    blocker.remove();
+                    anchor.style.anchorName = '';
+                    assignBookToFolder(bookName, folder.id);
+                });
+                menu.append(item);
+            }
+            const created = createStwidMenuItem('fa-plus', 'New Folder...', 'stwid--newBookFolder'); {
+                created.addEventListener('click', async()=>{
+                    blocker.remove();
+                    anchor.style.anchorName = '';
+                    const name = await promptForBookFolderName('New Lorebook Folder');
+                    if (!name) return;
+                    const result = createBookFolder(Settings.instance.bookFolders, name);
+                    if (!result.ok) {
+                        bookFolderWarning(result.reason);
+                        return;
+                    }
+                    moveBook(Settings.instance.bookFolders, currentBookNames(), bookName, result.folder.id, null);
+                    Settings.instance.save();
+                    layoutBookFolders();
+                });
+                menu.append(created);
+            }
+            if (current) {
+                const clear = createStwidMenuItem('fa-xmark', 'Move to Unfiled', 'stwid--clearBookFolder'); {
+                    clear.addEventListener('click', ()=>{
+                        blocker.remove();
+                        anchor.style.anchorName = '';
+                        assignBookToFolder(bookName, null);
+                    });
+                    menu.append(clear);
+                }
+            }
+            blocker.append(menu);
+        }
+        document.body.append(blocker);
+    }
+};
+const bindBookDragHandle = (head, book, name)=>{
+    head.draggable = true;
+    head.addEventListener('dragstart', (evt)=>{
+        const target = evt.target instanceof Element ? evt.target : evt.target?.parentElement;
+        if (target?.closest('input, button, .stwid--action, .stwid--actions')) {
+            evt.preventDefault();
+            return;
+        }
+        draggingBookName = name;
+        book.classList.add('stwid--isBookDragging');
+        evt.dataTransfer.effectAllowed = 'move';
+        evt.dataTransfer.setData('text/plain', name);
+        evt.stopPropagation();
+        const preview = document.createElement('div');
+        preview.classList.add('stwid--dragPreview');
+        preview.textContent = name;
+        document.body.append(preview);
+        try {
+            evt.dataTransfer.setDragImage(preview, 12, 12);
+        } catch { /* empty */ }
+        requestAnimationFrame(()=>preview.remove());
+    });
+    head.addEventListener('dragend', ()=>{
+        draggingBookName = null;
+        book.classList.remove('stwid--isBookDragging');
+        clearBookDragHints();
+    });
+};
+const bindBookFolderDrag = ()=>{
+    if (!dom.books || dom.books.dataset.bookFolderDrag == '1') return;
+    dom.books.dataset.bookFolderDrag = '1';
+    dom.books.addEventListener('dragover', (evt)=>{
+        if (!draggingBookName) return;
+        const target = evt.target instanceof Element ? evt.target : null;
+        const bookEl = target?.closest('.stwid--book') ?? null;
+        const folderEl = target?.closest('.stwid--bookFolder') ?? null;
+        if (!folderEl || !dom.books.contains(folderEl)) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        if (evt.dataTransfer) evt.dataTransfer.dropEffect = 'move';
+        clearBookDragHints();
+        if (bookEl && dom.books.contains(bookEl)) {
+            const rect = bookEl.getBoundingClientRect();
+            const before = evt.clientY < rect.top + (rect.height / 2);
+            bookEl.classList.add(before ? 'stwid--dropBefore' : 'stwid--dropAfter');
+            return;
+        }
+        folderEl.classList.add('stwid--bookFolderDropTarget');
+        folderEl.querySelector('.stwid--bookFolderHeader')?.classList.add('stwid--bookFolderDropTarget');
+    }, true);
+    dom.books.addEventListener('drop', (evt)=>{
+        if (!draggingBookName) return;
+        const target = evt.target instanceof Element ? evt.target : null;
+        const bookEl = target?.closest('.stwid--book') ?? null;
+        const folderEl = target?.closest('.stwid--bookFolder') ?? null;
+        if (!folderEl || !dom.books.contains(folderEl)) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        const bookName = draggingBookName;
+        const folderId = folderEl.dataset.folderId || null;
+        const targetBookName = bookEl?.dataset.bookName ?? null;
+        const placeBefore = bookEl
+            ? evt.clientY < bookEl.getBoundingClientRect().top + (bookEl.getBoundingClientRect().height / 2)
+            : true;
+        clearBookDragHints();
+        const drop = resolveBookDrop(
+            Settings.instance.bookFolders,
+            currentBookNames(),
+            bookName,
+            folderId,
+            targetBookName,
+            placeBefore,
+        );
+        draggingBookName = null;
+        if (!drop) return;
+        if (moveBook(Settings.instance.bookFolders, currentBookNames(), drop.bookName, drop.folderId, drop.beforeBookName)) {
+            Settings.instance.save();
+            layoutBookFolders();
+        }
+    }, true);
+    dom.books.addEventListener('dragleave', (evt)=>{
+        if (!draggingBookName) return;
+        const next = /**@type {Node|null}*/(evt.relatedTarget);
+        if (next && dom.books.contains(next)) return;
+        clearBookDragHints();
+    });
+};
 const updateSettingsChange = ()=>{
     console.log('[STWID]', '[UPDATE-SETTINGS]');
     for (const [name, world] of Object.entries(cache)) {
@@ -1039,6 +1401,7 @@ const updateWIChange = async(name = null, data = null, eventRevision = null)=>{
             await renderBook(name, before ? cache[before].dom.root : null);
         }
     }
+    layoutBookFolders();
     if (name && cache[name]) {
         if (!cache[name].loaded && !data) {
             updateWIChangeStarted = Promise.withResolvers();
@@ -1260,6 +1623,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
     const book = document.createElement('div'); {
         world.dom.root = book;
         book.classList.add('stwid--book');
+        book.dataset.bookName = name;
         book.addEventListener('dragover', (evt)=>{
             if (selectFrom === null) return;
             evt.preventDefault();
@@ -1300,6 +1664,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
         });
         const head = document.createElement('div'); {
             head.classList.add('stwid--head');
+            bindBookDragHandle(head, book, name);
             let collapseToggle;
             const title = document.createElement('div'); {
                 world.dom.name = title;
@@ -1352,6 +1717,19 @@ const renderBook = async(name, before = null, bookData = null)=>{
                         await saveManagedWorldInfo(name, data, true);
                     });
                     actions.append(add);
+                }
+                const folderAssign = document.createElement('div'); {
+                    world.dom.folderAssign = folderAssign;
+                    folderAssign.classList.add('stwid--action');
+                    folderAssign.classList.add('stwid--bookFolderAssign');
+                    folderAssign.classList.add('fa-solid', 'fa-fw', 'fa-folder');
+                    folderAssign.title = 'Move lorebook to folder';
+                    folderAssign.addEventListener('click', (evt)=>{
+                        evt.preventDefault();
+                        evt.stopPropagation();
+                        showBookFolderMenu(folderAssign, name);
+                    });
+                    actions.append(folderAssign);
                 }
                 const menuTrigger = document.createElement('div'); {
                     menuTrigger.classList.add('stwid--action');
@@ -1813,10 +2191,12 @@ const renderEntry = async(e, name, before = null)=>{
     }
 };
 const loadList = async()=>{
+    bookFolderShells.clear();
     dom.books.innerHTML = '';
     for (const name of world_names.toSorted((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()))) {
         await renderBook(name);
     }
+    layoutBookFolders();
 };
 const loadListDebounced = debounceAsync(()=>loadList());
 
@@ -1918,6 +2298,14 @@ const addDrawer = ()=>{
                             }
                         });
                         controls.append(add);
+                    }
+                    const addFolder = document.createElement('div'); {
+                        addFolder.classList.add('menu_button');
+                        addFolder.classList.add('stwid--addBookFolder');
+                        addFolder.classList.add('fa-solid', 'fa-fw', 'fa-folder-plus');
+                        addFolder.title = 'New Lorebook Folder\n---\nGroup whole lorebooks. Deleting a folder puts its lorebooks back in the unfiled list.';
+                        addFolder.addEventListener('click', ()=>createTopLevelBookFolder());
+                        controls.append(addFolder);
                     }
                     const imp = document.createElement('div'); {
                         imp.classList.add('menu_button');
@@ -2470,6 +2858,7 @@ const addDrawer = ()=>{
                                     }
                                 }
                             }
+                            dom.books?.classList.toggle('stwid--isFiltering', Boolean(query) || Boolean(filter.querySelector('.stwid--filterActive input')?.checked));
                         });
                         filter.append(search);
                     }
@@ -2504,6 +2893,7 @@ const addDrawer = ()=>{
                                         cache[b].dom.root.classList.remove('stwid--filter-active');
                                     }
                                 }
+                                dom.books?.classList.toggle('stwid--isFiltering', Boolean(filter.querySelector('.stwid--search')?.value) || inp.checked);
                             });
                             filterActive.append(inp);
                         }
@@ -2515,6 +2905,7 @@ const addDrawer = ()=>{
                 const books = document.createElement('div'); {
                     dom.books = books;
                     books.classList.add('stwid--books');
+                    bindBookFolderDrag();
                     list.append(books);
                 }
                 body.append(list);
