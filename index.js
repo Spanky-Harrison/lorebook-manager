@@ -7,7 +7,7 @@ import { renderTemplateAsync } from '../../../templates.js';
 import { debounce, debounceAsync, delay, download, getSortableDelay, isTrueBoolean, uuidv4 } from '../../../utils.js';
 import { createNewWorldInfo, createWorldInfoEntry, deleteWIOriginalDataValue, deleteWorldInfoEntry, getFreeWorldName, getWorldEntry, loadWorldInfo, onWorldInfoChange, saveWorldInfo, selected_world_info, setWIOriginalDataValue, world_info, world_names } from '../../../world-info.js';
 import { Settings, SORT, SORT_DIRECTION } from './src/Settings.js';
-import { createBookFolder, deleteBookFolder, getBookFolderId, getFolderBooks, getSortedBookFolders, getUnfiledBooks, moveBook, moveBookFolder, reconcileBookFolders, renameBookFolder, resolveBookDrop, setBookFolderCollapsed } from './src/BookFolders.js';
+import { createBookFolder, deleteBookFolder, getBookFolderId, getFolderBooks, getSortedBookFolders, getUnfiledBooks, moveBook, moveBookFolder, moveBooks, reconcileBookFolders, renameBookFolder, setBookFolderCollapsed } from './src/BookFolders.js';
 
 const NAME = new URL(import.meta.url).pathname.split('/').at(-2);
 const DISPLAY_NAME = 'Lorebook Manager';
@@ -532,11 +532,12 @@ const createStwidMenuItem = (iconClass, label, className = '')=>{
     return item;
 };
 const bindFolderDropTarget = (target, worldName, folderName)=>{
-    const setDropTarget = (isTarget)=>{
-        target.classList.toggle('stwid--folderDropTarget', isTarget);
-        const folderHeader = target.classList.contains('stwid--folderHeader') ? target : target.previousElementSibling;
-        folderHeader?.classList.toggle('stwid--folderDropTarget', isTarget);
-    };
+const setDropTarget = (isTarget)=>{
+    if (target.classList.contains('stwid--folderDropTarget') == isTarget) return;
+    target.classList.toggle('stwid--folderDropTarget', isTarget);
+    const folderHeader = target.classList.contains('stwid--folderHeader') ? target : target.previousElementSibling;
+    folderHeader?.classList.toggle('stwid--folderDropTarget', isTarget);
+};
     target.addEventListener('dragover', (evt)=>{
         if (selectFrom === null || !selectList?.length) return;
         evt.preventDefault();
@@ -1005,6 +1006,12 @@ const createManageFolderButton = (iconClass, title)=>{
 };
 /** @type {string|null} Lorebook currently being dragged between top-level folders */
 let draggingBookName = null;
+/** @type {string[]|null} Lorebooks moved by the current drag, in list order */
+let draggingBookNames = null;
+/** @type {Set<string>} */
+const bookSelection = new Set();
+/** @type {string|null} */
+let bookSelectAnchor = null;
 /** @type {Map<string, {root:HTMLElement, header:HTMLElement, body:HTMLElement, label:HTMLElement, count:HTMLElement, up?:HTMLButtonElement, down?:HTMLButtonElement}>} */
 const bookFolderShells = new Map();
 const UNFILED_BOOK_FOLDER_KEY = '';
@@ -1023,10 +1030,103 @@ const promptForBookFolderName = async(title, defaultValue = '')=>{
     return name || null;
 };
 const currentBookNames = ()=>Array.isArray(world_names) ? [...world_names] : [];
+/** Last drop hint. Cleared by touching only those nodes, never by scanning the book list. */
+let bookDragHint = null;
+/** Book geometry for the insertion side. Measured when the hovered book or scroll position changes, not on every dragover. */
+let bookDragMetrics = null;
 const clearBookDragHints = ()=>{
-    dom.books?.querySelectorAll('.stwid--dropBefore, .stwid--dropAfter, .stwid--bookFolderDropTarget').forEach(el=>{
-        el.classList.remove('stwid--dropBefore', 'stwid--dropAfter', 'stwid--bookFolderDropTarget');
-    });
+    if (!bookDragHint) return;
+    bookDragHint.book?.classList.remove('stwid--dropBefore', 'stwid--dropAfter');
+    bookDragHint.folder?.classList.remove('stwid--bookFolderDropTarget');
+    bookDragHint.header?.classList.remove('stwid--bookFolderDropTarget');
+    bookDragHint = null;
+};
+const showBookDragHint = (hint)=>{
+    if (bookDragHint
+        && bookDragHint.key === hint.key
+        && bookDragHint.book === hint.book
+        && bookDragHint.folder === hint.folder
+        && bookDragHint.header === hint.header
+    ) return;
+    clearBookDragHints();
+    if (hint.book) hint.book.classList.add(hint.side == 'before' ? 'stwid--dropBefore' : 'stwid--dropAfter');
+    hint.folder?.classList.add('stwid--bookFolderDropTarget');
+    hint.header?.classList.add('stwid--bookFolderDropTarget');
+    bookDragHint = hint;
+};
+const setBookFolderCount = (folderId)=>{
+    const shell = bookFolderShells.get(folderId || UNFILED_BOOK_FOLDER_KEY);
+    if (!shell) return;
+    const state = Settings.instance.bookFolders;
+    const names = currentBookNames();
+    const count = folderId ? getFolderBooks(state, names, folderId).length : getUnfiledBooks(state, names).length;
+    const text = String(count);
+    if (shell.count.textContent !== text) shell.count.textContent = text;
+};
+/**
+ * Put one folder's book nodes in stored order. Nodes that are already in place
+ * stay put, so an open lorebook is not reparented unless it actually moved.
+ */
+const syncFolderBookNodes = (folderId)=>{
+    const shell = bookFolderShells.get(folderId || UNFILED_BOOK_FOLDER_KEY);
+    if (!shell) return false;
+    const state = Settings.instance.bookFolders;
+    const names = currentBookNames();
+    const group = folderId ? getFolderBooks(state, names, folderId) : getUnfiledBooks(state, names);
+    let cursor = shell.body.firstChild;
+    for (const bookName of group) {
+        const root = cache[bookName]?.dom?.root;
+        if (!root) continue;
+        if (cursor === root) {
+            cursor = root.nextSibling;
+            continue;
+        }
+        shell.body.insertBefore(root, cursor);
+    }
+    setBookFolderCount(folderId);
+    return true;
+};
+const bookListOrder = ()=>{
+    const state = Settings.instance.bookFolders;
+    const names = currentBookNames();
+    const ordered = [];
+    for (const folder of getSortedBookFolders(state)) ordered.push(...getFolderBooks(state, names, folder.id));
+    ordered.push(...getUnfiledBooks(state, names));
+    return ordered;
+};
+const paintBookSelection = (bookName)=>{
+    const root = cache[bookName]?.dom?.root;
+    if (!root) return;
+    const selected = bookSelection.has(bookName);
+    root.classList.toggle('stwid--isBookSelected', selected);
+    const icon = root.querySelector(':scope > .stwid--head .stwid--bookSelect .stwid--icon');
+    if (!icon) return;
+    icon.classList.toggle('fa-square-check', selected);
+    icon.classList.toggle('fa-square', !selected);
+};
+const toggleBookSelection = (bookName, shift)=>{
+    if (shift && bookSelectAnchor && bookSelectAnchor != bookName) {
+        const order = bookListOrder();
+        const start = order.indexOf(bookSelectAnchor);
+        const end = order.indexOf(bookName);
+        if (start >= 0 && end >= 0) {
+            const [from, to] = start < end ? [start, end] : [end, start];
+            for (let i = from; i <= to; i++) {
+                bookSelection.add(order[i]);
+                paintBookSelection(order[i]);
+            }
+            return;
+        }
+    }
+    if (bookSelection.has(bookName)) bookSelection.delete(bookName);
+    else bookSelection.add(bookName);
+    bookSelectAnchor = bookName;
+    paintBookSelection(bookName);
+};
+const booksForDrag = (bookName)=>{
+    if (!bookSelection.has(bookName)) return [bookName];
+    const picked = bookListOrder().filter(name=>bookSelection.has(name));
+    return picked.length ? picked : [bookName];
 };
 const updateBookFolderAssignButton = (name)=>{
     const button = cache[name]?.dom?.folderAssign;
@@ -1285,14 +1385,22 @@ const bindBookDragHandle = (head, book, name)=>{
             evt.preventDefault();
             return;
         }
+        if (target?.closest('.stwid--bookSelect')) {
+            evt.preventDefault();
+            return;
+        }
+        const moving = booksForDrag(name);
         draggingBookName = name;
-        book.classList.add('stwid--isBookDragging');
+        draggingBookNames = moving;
+        bookDragMetrics = null;
+        dom.books?.classList.add('stwid--isBookDrag');
+        for (const bookName of moving) cache[bookName]?.dom?.root?.classList.add('stwid--isBookDragging');
         evt.dataTransfer.effectAllowed = 'move';
-        evt.dataTransfer.setData('text/plain', name);
+        evt.dataTransfer.setData('text/plain', moving.length > 1 ? `${moving.length} lorebooks` : name);
         evt.stopPropagation();
         const preview = document.createElement('div');
         preview.classList.add('stwid--dragPreview');
-        preview.textContent = name;
+        preview.textContent = moving.length > 1 ? `${moving.length} lorebooks` : name;
         document.body.append(preview);
         try {
             evt.dataTransfer.setDragImage(preview, 12, 12);
@@ -1300,62 +1408,107 @@ const bindBookDragHandle = (head, book, name)=>{
         requestAnimationFrame(()=>preview.remove());
     });
     head.addEventListener('dragend', ()=>{
+        for (const bookName of draggingBookNames ?? []) cache[bookName]?.dom?.root?.classList.remove('stwid--isBookDragging');
         draggingBookName = null;
-        book.classList.remove('stwid--isBookDragging');
+        draggingBookNames = null;
+        bookDragMetrics = null;
+        dom.books?.classList.remove('stwid--isBookDrag');
         clearBookDragHints();
     });
+};
+const bookDragTarget = (evt)=>{
+    const target = evt.target instanceof Element ? evt.target : null;
+    if (!target || !dom.books?.contains(target)) return null;
+    const bookEl = target.closest('.stwid--book');
+    if (bookEl) {
+        const scrollTop = dom.books.scrollTop;
+        if (!bookDragMetrics || bookDragMetrics.book !== bookEl) {
+            const rect = bookEl.getBoundingClientRect();
+            bookDragMetrics = {
+                book: bookEl,
+                scrollTop,
+                mid: rect.top + (rect.height / 2),
+            };
+        } else if (bookDragMetrics.scrollTop !== scrollTop) {
+            bookDragMetrics.mid += bookDragMetrics.scrollTop - scrollTop;
+            bookDragMetrics.scrollTop = scrollTop;
+        }
+        const before = evt.clientY < bookDragMetrics.mid;
+        return {
+            key: `book:${bookEl.dataset.bookName}:${before ? 'before' : 'after'}`,
+            book: bookEl,
+            side: before ? 'before' : 'after',
+            bookName: bookEl.dataset.bookName ?? null,
+            placeBefore: before,
+            folderEl: bookEl.closest('.stwid--bookFolder'),
+        };
+    }
+    const folderEl = target.closest('.stwid--bookFolder');
+    if (!folderEl) return null;
+    const shell = bookFolderShells.get(folderEl.dataset.folderId || UNFILED_BOOK_FOLDER_KEY);
+    return {
+        key: `folder:${folderEl.dataset.folderId || ''}`,
+        book: null,
+        side: null,
+        bookName: null,
+        placeBefore: true,
+        folderEl,
+        header: shell?.header ?? null,
+    };
 };
 const bindBookFolderDrag = ()=>{
     if (!dom.books || dom.books.dataset.bookFolderDrag == '1') return;
     dom.books.dataset.bookFolderDrag = '1';
+    // Same shape as the entry drag: one class on the current target and no list scan.
+    // Book geometry is read when the hovered book or the scroll position changes.
     dom.books.addEventListener('dragover', (evt)=>{
         if (!draggingBookName) return;
-        const target = evt.target instanceof Element ? evt.target : null;
-        const bookEl = target?.closest('.stwid--book') ?? null;
-        const folderEl = target?.closest('.stwid--bookFolder') ?? null;
-        if (!folderEl || !dom.books.contains(folderEl)) return;
+        const hit = bookDragTarget(evt);
+        if (!hit?.folderEl) return;
         evt.preventDefault();
         evt.stopPropagation();
         if (evt.dataTransfer) evt.dataTransfer.dropEffect = 'move';
-        clearBookDragHints();
-        if (bookEl && dom.books.contains(bookEl)) {
-            const rect = bookEl.getBoundingClientRect();
-            const before = evt.clientY < rect.top + (rect.height / 2);
-            bookEl.classList.add(before ? 'stwid--dropBefore' : 'stwid--dropAfter');
-            return;
-        }
-        folderEl.classList.add('stwid--bookFolderDropTarget');
-        folderEl.querySelector('.stwid--bookFolderHeader')?.classList.add('stwid--bookFolderDropTarget');
+        showBookDragHint({
+            key: hit.key,
+            book: hit.book,
+            side: hit.side,
+            folder: hit.book ? null : hit.folderEl,
+            header: hit.header ?? null,
+        });
     }, true);
     dom.books.addEventListener('drop', (evt)=>{
         if (!draggingBookName) return;
-        const target = evt.target instanceof Element ? evt.target : null;
-        const bookEl = target?.closest('.stwid--book') ?? null;
-        const folderEl = target?.closest('.stwid--bookFolder') ?? null;
-        if (!folderEl || !dom.books.contains(folderEl)) return;
+        const hit = bookDragTarget(evt);
+        if (!hit?.folderEl) return;
         evt.preventDefault();
         evt.stopPropagation();
-        const bookName = draggingBookName;
-        const folderId = folderEl.dataset.folderId || null;
-        const targetBookName = bookEl?.dataset.bookName ?? null;
-        const placeBefore = bookEl
-            ? evt.clientY < bookEl.getBoundingClientRect().top + (bookEl.getBoundingClientRect().height / 2)
-            : true;
+        const moving = draggingBookNames?.length ? [...draggingBookNames] : [draggingBookName];
+        const movingSet = new Set(moving);
+        const folderId = hit.folderEl.dataset.folderId || null;
         clearBookDragHints();
-        const drop = resolveBookDrop(
-            Settings.instance.bookFolders,
-            currentBookNames(),
-            bookName,
-            folderId,
-            targetBookName,
-            placeBefore,
-        );
         draggingBookName = null;
-        if (!drop) return;
-        if (moveBook(Settings.instance.bookFolders, currentBookNames(), drop.bookName, drop.folderId, drop.beforeBookName)) {
-            Settings.instance.save();
-            layoutBookFolders();
+        draggingBookNames = null;
+        bookDragMetrics = null;
+        dom.books.classList.remove('stwid--isBookDrag');
+        for (const bookName of moving) cache[bookName]?.dom?.root?.classList.remove('stwid--isBookDragging');
+        if (hit.bookName && movingSet.has(hit.bookName)) return;
+        const names = currentBookNames();
+        const state = Settings.instance.bookFolders;
+        let beforeBookName = null;
+        if (hit.bookName && names.includes(hit.bookName)) {
+            const stationary = (folderId ? getFolderBooks(state, names, folderId) : getUnfiledBooks(state, names)).filter(bookName=>!movingSet.has(bookName));
+            if (hit.placeBefore) beforeBookName = hit.bookName;
+            else {
+                const index = stationary.indexOf(hit.bookName);
+                beforeBookName = index >= 0 ? (stationary[index + 1] ?? null) : null;
+            }
         }
+        const sourceFolders = new Set(moving.map(bookName=>getBookFolderId(state, bookName)));
+        if (!moveBooks(state, names, moving, folderId, beforeBookName)) return;
+        sourceFolders.add(folderId);
+        for (const sourceFolderId of sourceFolders) syncFolderBookNodes(sourceFolderId);
+        for (const bookName of moving) updateBookFolderAssignButton(bookName);
+        Settings.instance.save();
     }, true);
     dom.books.addEventListener('dragleave', (evt)=>{
         if (!draggingBookName) return;
@@ -1390,6 +1543,7 @@ const updateWIChange = async(name = null, data = null, eventRevision = null)=>{
         if (world_names.includes(n)) continue;
         else {
             w.dom.root.remove();
+            bookSelection.delete(n);
             delete cache[n];
         }
     }
@@ -1627,10 +1781,12 @@ const renderBook = async(name, before = null, bookData = null)=>{
         book.addEventListener('dragover', (evt)=>{
             if (selectFrom === null) return;
             evt.preventDefault();
-            book.classList.add('stwid--isTarget');
+            if (!book.classList.contains('stwid--isTarget')) book.classList.add('stwid--isTarget');
         });
         book.addEventListener('dragleave', (evt)=>{
             if (selectFrom === null) return;
+            const next = evt.relatedTarget;
+            if (next instanceof Node && book.contains(next)) return;
             book.classList.remove('stwid--isTarget');
         });
         book.addEventListener('drop', async(evt)=>{
@@ -1665,6 +1821,21 @@ const renderBook = async(name, before = null, bookData = null)=>{
         const head = document.createElement('div'); {
             head.classList.add('stwid--head');
             bindBookDragHandle(head, book, name);
+            const bookSelect = document.createElement('div'); {
+                bookSelect.classList.add('stwid--bookSelect');
+                bookSelect.title = 'Select lorebook\n---\nShift-click to select a range.\nDrag a selected lorebook to move the whole selection.';
+                bookSelect.addEventListener('click', (evt)=>{
+                    evt.preventDefault();
+                    evt.stopPropagation();
+                    toggleBookSelection(name, evt.shiftKey);
+                });
+                const icon = document.createElement('div'); {
+                    icon.classList.add('stwid--icon');
+                    icon.classList.add('fa-solid', 'fa-square');
+                    bookSelect.append(icon);
+                }
+                head.append(bookSelect);
+            }
             let collapseToggle;
             const title = document.createElement('div'); {
                 world.dom.name = title;

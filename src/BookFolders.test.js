@@ -8,6 +8,7 @@ import {
     getUnfiledBooks,
     moveBook,
     moveBookFolder,
+    moveBooks,
     normalizeBookFolderState,
     reconcileBookFolders,
     renameBookFolder,
@@ -69,6 +70,23 @@ test('drag into a folder, between folders, and back to unfiled preserves order',
     assert.equal(moveBook(state, names, ontoUnfiledBook.bookName, ontoUnfiledBook.folderId, ontoUnfiledBook.beforeBookName), true);
     assert.deepEqual(getUnfiledBooks(state, names), ['Delta', 'Beta']);
     assert.equal(resolveBookDrop(state, names, 'Delta', null, 'Delta', true), null);
+});
+
+test('a selection of lorebooks moves together and keeps its order', ()=>{
+    const state = setup();
+    moveBook(state, names, 'Delta', 'folder-places', null);
+    assert.equal(moveBooks(state, names, ['Gamma', 'Alpha'], 'folder-characters', null), true);
+    assert.deepEqual(getFolderBooks(state, names, 'folder-characters'), ['Gamma', 'Alpha']);
+    assert.equal(moveBooks(state, names, ['Alpha', 'Gamma'], 'folder-places', 'Delta'), true);
+    assert.deepEqual(getFolderBooks(state, names, 'folder-places'), ['Alpha', 'Gamma', 'Delta']);
+    assert.deepEqual(getFolderBooks(state, names, 'folder-characters'), []);
+    assert.equal(moveBooks(state, names, ['Nope'], 'folder-characters', null), false);
+    assert.equal(moveBooks(state, names, ['Gamma'], 'missing-folder', null), false);
+    assert.equal(moveBooks(state, names, ['Gamma', 'Beta'], null, null), true);
+    assert.deepEqual(getUnfiledBooks(state, names), ['Gamma', 'Beta']);
+    assert.deepEqual(getFolderBooks(state, names, 'folder-places'), ['Alpha', 'Delta']);
+    assert.equal(moveBooks(state, names, ['Missing', 'Alpha'], 'folder-characters', null), true);
+    assert.deepEqual(getFolderBooks(state, names, 'folder-characters'), ['Alpha']);
 });
 
 test('deleting a folder returns its lorebooks to the unfiled list', ()=>{
