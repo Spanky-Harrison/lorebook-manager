@@ -122,7 +122,7 @@ body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book .stwid--head {
 body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book .stwid--head .stwid--title {
   flex: 1 1 auto;
   min-width: 0;
-  cursor: pointer;
+  cursor: grab;
   font-weight: bold;
   overflow: hidden;
   overflow-wrap: anywhere;
@@ -339,6 +339,158 @@ body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book .stwid--entry .s
 body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book .stwid--entry .stwid--actions .stwid--folderAssign.stwid--folderAssigned {
   opacity: 1;
   color: var(--SmartThemeQuoteColor);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book > .stwid--head {
+  cursor: grab;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book > .stwid--head .stwid--actions,
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book > .stwid--head .stwid--actions * {
+  cursor: pointer;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book.stwid--isBookDragging {
+  opacity: 0.45;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book.stwid--dropBefore {
+  box-shadow: inset 0 3px 0 orange;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book.stwid--dropAfter {
+  box-shadow: inset 0 -3px 0 orange;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books .stwid--book > .stwid--head .stwid--bookFolderAssign.stwid--bookFolderAssigned {
+  opacity: 1;
+  color: var(--SmartThemeQuoteColor);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder {
+  margin: 0 0 0.45em;
+  border: 1px solid var(--SmartThemeBorderColor);
+  border-radius: 6px;
+  background-color: color-mix(in srgb, var(--SmartThemeQuoteColor) 4%, transparent);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books:not(.stwid--hasBookFolders) > .stwid--bookFolderUnfiled {
+  margin: 0;
+  border: 0;
+  background: transparent;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books:not(.stwid--hasBookFolders) > .stwid--bookFolderUnfiled > .stwid--bookFolderHeader {
+  display: none;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books:not(.stwid--hasBookFolders) > .stwid--bookFolderUnfiled > .stwid--bookFolderBody {
+  min-height: 0;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books:not(.stwid--hasBookFolders) > .stwid--bookFolderUnfiled > .stwid--bookFolderBody:empty::after {
+  content: none;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  box-sizing: border-box;
+  min-height: 1.9em;
+  margin: 0;
+  padding: 0.28em 0.45em;
+  border: 0;
+  border-bottom: 1px solid var(--SmartThemeBorderColor);
+  border-left: 3px solid var(--SmartThemeQuoteColor);
+  border-radius: 6px 6px 0 0;
+  background-color: color-mix(in srgb, var(--SmartThemeQuoteColor) 12%, var(--SmartThemeBlurTintColor));
+  color: var(--SmartThemeBodyColor);
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder.stwid--bookFolderUnfiled > .stwid--bookFolderHeader {
+  cursor: default;
+  border-left-color: var(--SmartThemeBorderColor);
+  background-color: color-mix(in srgb, var(--SmartThemeBlurTintColor) 88%, var(--SmartThemeQuoteColor));
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader:hover {
+  background-color: color-mix(in srgb, var(--SmartThemeQuoteColor) 18%, var(--SmartThemeBlurTintColor));
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder.stwid--bookFolderDropTarget > .stwid--bookFolderHeader,
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader.stwid--bookFolderDropTarget {
+  background-color: color-mix(in srgb, orange 18%, var(--SmartThemeBlurTintColor));
+  box-shadow: inset 0 0 0 1px orange;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder.stwid--bookFolderCollapsed > .stwid--bookFolderHeader {
+  border-bottom: 0;
+  border-radius: 6px;
+  opacity: 0.85;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder.stwid--bookFolderCollapsed > .stwid--bookFolderBody {
+  display: none;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderChevron,
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderAction {
+  flex: 0 0 auto;
+  min-width: 1.35em;
+  min-height: 1.35em;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderChevron {
+  transition: transform 200ms ease-in-out;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder.stwid--bookFolderCollapsed > .stwid--bookFolderHeader .stwid--bookFolderChevron {
+  transform: rotate(-90deg);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderAction:hover,
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderChevron:hover {
+  opacity: 1;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderAction:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderDelete:hover {
+  color: var(--fullred);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderName {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderHeader .stwid--bookFolderCount {
+  flex: 0 0 auto;
+  min-width: 1.35em;
+  padding: 0 0.4em;
+  border-radius: 999px;
+  background-color: var(--SmartThemeQuoteColor);
+  color: var(--SmartThemeBlurTintColor);
+  font-size: calc(var(--mainFontSize) * 0.75);
+  font-weight: 700;
+  text-align: center;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books > .stwid--bookFolder > .stwid--bookFolderBody {
+  min-height: 0.35em;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books.stwid--hasBookFolders > .stwid--bookFolder > .stwid--bookFolderBody:empty {
+  min-height: 1.7em;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books.stwid--hasBookFolders > .stwid--bookFolder > .stwid--bookFolderBody:empty::after {
+  content: 'Drop lorebooks here';
+  display: block;
+  padding: 0.35em 0.7em 0.55em;
+  opacity: 0.55;
+  font-size: calc(var(--mainFontSize) * 0.85);
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books.stwid--hasBookFolders > .stwid--bookFolder > .stwid--bookFolderBody > .stwid--book {
+  margin-left: 0.35em;
+  margin-right: 0.15em;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books.stwid--hasBookFolders > .stwid--bookFolder > .stwid--bookFolderBody > .stwid--book > .stwid--head {
+  top: 2em;
+}
+body.stwid-- #WorldInfo .stwid--list .stwid--books.stwid--isFiltering > .stwid--bookFolder:not(:has(.stwid--book:not(.stwid--filter-query):not(.stwid--filter-active))) {
+  display: none;
 }
 body.stwid-- #WorldInfo .stwid--editor {
   flex: 1 1 auto;
