@@ -6,6 +6,7 @@ import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.j
 import { renderTemplateAsync } from '../../../templates.js';
 import { debounce, debounceAsync, delay, download, getSortableDelay, isTrueBoolean, uuidv4 } from '../../../utils.js';
 import { createNewWorldInfo, createWorldInfoEntry, deleteWIOriginalDataValue, deleteWorldInfoEntry, getFreeWorldName, getWorldEntry, loadWorldInfo, onWorldInfoChange, saveWorldInfo, selected_world_info, setWIOriginalDataValue, world_info, world_names } from '../../../world-info.js';
+import * as worldInfoModule from '../../../world-info.js';
 import { Settings, SORT, SORT_DIRECTION } from './src/Settings.js';
 import { createBookFolder, deleteBookFolder, getBookFolderId, getFolderBooks, getSortedBookFolders, getUnfiledBooks, moveBook, moveBookFolder, moveBooks, reconcileBookFolders, renameBookFolder, setBookFolderCollapsed } from './src/BookFolders.js';
 
@@ -99,9 +100,39 @@ const markLocalBookRevision = (name)=>{
     return localBookRevisions[name];
 };
 const getLocalBookRevision = (name)=>localBookRevisions[name] ?? 0;
+/**
+ * The one book object the manager edits for a loaded book. SillyTavern's entry editor,
+ * the sidebar toggles and the Order Helper all write into this same object, so a save
+ * from any of them carries the others' changes.
+ * @param {string} name
+ */
+const getLiveBook = (name)=>cache[name]?.loaded ? cache[name].data : null;
+const isLiveBook = (name, data)=>{
+    const live = getLiveBook(name);
+    return !!(live && data && (data === live || data.entries === live.entries));
+};
+/** Book whose entry editor typed changes that SillyTavern has not written yet (its save waits ~1s). */
+let pendingEditorSave = null;
+/**
+ * SillyTavern keeps a single debounced save timer for every book, and any immediate save
+ * cancels it. Write the editor's book now, before something else can drop its pending save.
+ * @param {string|null} exceptName Skip the flush when the pending save is for this book.
+ */
+const flushEditorSave = async(exceptName = null)=>{
+    const name = pendingEditorSave;
+    if (!name || name === exceptName) return;
+    pendingEditorSave = null;
+    const live = getLiveBook(name);
+    if (!live || !world_names.includes(name)) return;
+    await saveWorldInfo(name, live, true);
+};
 const saveManagedWorldInfo = async(name, data, immediately = true)=>{
+    await flushEditorSave(name);
     const revision = markLocalBookRevision(name);
-    if (data && typeof data == 'object') {
+    if (isLiveBook(name, data)) {
+        // Saving the live object also covers any pending editor save for this book.
+        if (pendingEditorSave === name) pendingEditorSave = null;
+    } else if (data && typeof data == 'object') {
         Object.defineProperty(data, localSaveRevision, {
             value: revision,
             configurable: true,
@@ -477,17 +508,19 @@ const loadBookEntries = async(name, bookData = null)=>{
     if (world.loading) return world.loading;
 
     world.loading = (async()=>{
-        const data = bookData ?? await loadWorldInfo(name);
+        // loadWorldInfo already hands back a private copy; event data belongs to its sender.
+        const data = bookData ? structuredClone(bookData) : await loadWorldInfo(name);
         if (!data?.entries) {
             world.loading = null;
             return world;
         }
 
         migrateEntryFolders(name, data);
-        world.entries = {};
-        for (const [k,v] of Object.entries(data.entries)) {
-            world.entries[k] = structuredClone(v);
-        }
+        // Keep the whole book (originalData and any other top-level fields), not just entries,
+        // so saves do not strip them from the file.
+        world.data = data;
+        world.entries = data.entries;
+        world.shown = {};
         world.dom.entryList.innerHTML = '';
         world.dom.entry = {};
         let renderCounter = 0;
@@ -784,16 +817,36 @@ const toggleFolder = (worldName, folderName, collapsed = null)=>{
         entry.classList.toggle('stwid--folderHidden', nextCollapsed);
     });
 };
-const regroupBookEntries = (name)=>{
+/**
+ * Move a single entry row when it is the only thing whose place changed (a renamed title).
+ * @returns {boolean} false when the change is bigger and the list needs a full regroup
+ */
+const moveOneEntryRow = (world, before, after, uid)=>{
+    const without = (layout)=>JSON.stringify(layout.map(([folderName, collapsed, uids])=>[folderName, collapsed, uids.filter(it=>it !== uid)]));
+    if (without(before) !== without(after)) return false;
+    const groupIndex = after.findIndex(([, , uids])=>uids.includes(uid));
+    if (groupIndex < 0 || !before[groupIndex]?.[2].includes(uid)) return false;
+    const row = world.dom.entry[uid]?.root;
+    if (!row?.isConnected) return false;
+    const uids = after[groupIndex][2];
+    const nextUid = uids[uids.indexOf(uid) + 1];
+    let ref = null;
+    if (nextUid !== undefined) ref = world.dom.entry[nextUid]?.root;
+    else if (after[groupIndex + 1]) ref = world.dom.folder[after[groupIndex + 1][0]]?.root;
+    if (ref === undefined || (ref && ref.parentElement != world.dom.entryList)) return false;
+    world.dom.entryList.insertBefore(row, ref);
+    return true;
+};
+/**
+ * @param {string} name
+ * @param {{ skipIfUnchanged?:boolean, changedUids?:string[] }} [options] skipIfUnchanged: leave the
+ *   DOM alone when the folders, their collapsed state and the entry order come out the same as last
+ *   time, and only move the row when a single changed entry just changed place.
+ */
+const regroupBookEntries = (name, { skipIfUnchanged = false, changedUids = [] } = {})=>{
     const world = cache[name];
     if (!world?.dom?.entryList || !world.loaded) return;
     const state = getWorldFolderState(name);
-    world.dom.folder = Object.create(null);
-    world.dom.entryList.querySelectorAll('.stwid--folderHeader, .stwid--folderDropZone').forEach(header=>header.remove());
-    Object.values(world.dom.entry).forEach(entry=>{
-        entry.root.classList.remove('stwid--folderEntry', 'stwid--folderHidden');
-        entry.root.removeAttribute('data-folder');
-    });
     const entries = sortEntries(Object.values(world.entries));
     const folders = getFolderNames(name, { entries:world.entries });
     const groups = new Map(folders.map(folderName=>[folderName, []]));
@@ -810,6 +863,28 @@ const regroupBookEntries = (name)=>{
     if (uncategorized.length || groups.size == 0) {
         groups.set(UNCATEGORIZED_KEY, uncategorized);
     }
+    // Re-appending every row of a 1,500-entry book costs most of a second, so a save that
+    // does not move anything (most title edits) should not pay for it.
+    const layout = [...groups].map(([folderName, groupEntries])=>[
+        folderName,
+        Boolean(state.collapsed[folderName]),
+        groupEntries.map(entry=>String(entry.uid)),
+    ]);
+    const layoutKey = JSON.stringify(layout);
+    if (skipIfUnchanged && layoutKey === world.layoutKey) return;
+    if (skipIfUnchanged && changedUids.length == 1 && world.layout && moveOneEntryRow(world, world.layout, layout, String(changedUids[0]))) {
+        world.layout = layout;
+        world.layoutKey = layoutKey;
+        return;
+    }
+    world.layout = layout;
+    world.layoutKey = layoutKey;
+    world.dom.folder = Object.create(null);
+    world.dom.entryList.querySelectorAll('.stwid--folderHeader, .stwid--folderDropZone').forEach(header=>header.remove());
+    Object.values(world.dom.entry).forEach(entry=>{
+        entry.root.classList.remove('stwid--folderEntry', 'stwid--folderHidden');
+        entry.root.removeAttribute('data-folder');
+    });
     const fragment = document.createDocumentFragment();
     for (const [folderName, groupEntries] of groups) {
         fragment.append(createFolderHeader(name, folderName, groupEntries.length));
@@ -1526,152 +1601,225 @@ const updateSettingsChange = ()=>{
         }
     }
 };
-let updateWIChangeStarted = Promise.withResolvers();
-/**@type {PromiseWithResolvers<any>} */
-let updateWIChangeFinished;
-const updateWIChange = async(name = null, data = null, eventRevision = null)=>{
-    console.log('[STWID]', '[UPDATE-WI]', name, data);
-    eventRevision ??= data?.[localSaveRevision] ?? null;
-    if (name && eventRevision !== null && cache[name]?.loaded && getLocalBookRevision(name) > eventRevision) {
-        console.debug('[STWID]', '[UPDATE-WI]', 'Skipping stale update for', name);
-        return;
-    }
-    updateWIChangeFinished = Promise.withResolvers();
-    updateWIChangeStarted.resolve();
+/** Books added to or removed from SillyTavern (create, duplicate, rename, delete, import). */
+const reconcileBookList = async()=>{
     // removed books
     for (const [n, w] of Object.entries(cache)) {
         if (world_names.includes(n)) continue;
-        else {
-            w.dom.root.remove();
-            bookSelection.delete(n);
-            delete cache[n];
+        w.dom.root.remove();
+        bookSelection.delete(n);
+        delete cache[n];
+        if (pendingEditorSave === n) pendingEditorSave = null;
+        if (currentEditor?.name == n) {
+            currentEditor = null;
+            dom.editor.innerHTML = '';
         }
     }
     // added books
     for (const name of world_names) {
         if (cache[name]) continue;
-        else {
-            const before = Object.keys(cache).find(it=>it.toLowerCase().localeCompare(name.toLowerCase()) == 1);
-            await renderBook(name, before ? cache[before].dom.root : null);
-        }
+        const before = Object.keys(cache).find(it=>it.toLowerCase().localeCompare(name.toLowerCase()) == 1);
+        await renderBook(name, before ? cache[before].dom.root : null);
     }
     layoutBookFolders();
-    if (name && cache[name]) {
-        if (!cache[name].loaded && !data) {
-            updateWIChangeStarted = Promise.withResolvers();
-            updateWIChangeFinished.resolve();
-            return;
+};
+/**
+ * Copy a book saved from some other object (a loadWorldInfo copy, SillyTavern's own
+ * editor, another extension) into the live book in place, so the entry editor keeps
+ * pointing at the object that holds the current data.
+ */
+const mergeIntoLiveBook = (name, data)=>{
+    const live = getLiveBook(name);
+    if (!live || !data?.entries) return;
+    for (const k of Object.keys(live)) {
+        if (k != 'entries' && !Object.hasOwn(data, k)) delete live[k];
+    }
+    for (const [k, v] of Object.entries(data)) {
+        if (k != 'entries') live[k] = structuredClone(v);
+    }
+    const focusedUid = currentEditor?.name == name && dom.editor.contains(document.activeElement) ? String(currentEditor.uid) : null;
+    for (const uid of Object.keys(live.entries)) {
+        if (!Object.hasOwn(data.entries, uid)) delete live.entries[uid];
+    }
+    for (const [uid, src] of Object.entries(data.entries)) {
+        const dst = live.entries[uid];
+        if (!dst) {
+            live.entries[uid] = structuredClone(src);
+            continue;
         }
-        if (!cache[name].loaded && data) {
-            await loadBookEntries(name, data);
-            updateWIChangeStarted = Promise.withResolvers();
-            updateWIChangeFinished.resolve();
-            return;
+        // keep what is being typed in the open editor
+        if (uid === focusedUid || dst === src) continue;
+        for (const k of Object.keys(dst)) {
+            if (!Object.hasOwn(src, k)) delete dst[k];
         }
+        Object.assign(dst, structuredClone(src));
+    }
+};
+/** Entry fields that sortEntries and the entry-folder grouping read. */
+const SORT_FIELDS = new Set(['comment', 'key', 'position', 'depth', 'order', 'extensions']);
+const applyWIChange = async(name = null, data = null, eventRevision = null)=>{
+    console.log('[STWID]', '[UPDATE-WI]', name, data);
+    const isLive = isLiveBook(name, data);
+    eventRevision ??= data?.[localSaveRevision] ?? null;
+    if (!isLive && name && eventRevision !== null && cache[name]?.loaded && getLocalBookRevision(name) > eventRevision) {
+        console.debug('[STWID]', '[UPDATE-WI]', 'Skipping stale update for', name);
+        return;
+    }
+    await reconcileBookList();
+    if (!name || !cache[name]) return;
+    const world = cache[name];
+    if (!world.loaded) {
+        if (data) await loadBookEntries(name, data);
+        return;
+    }
+    if (!isLive) {
         if (!data) data = await loadWorldInfo(name);
-        migrateEntryFolders(name, data);
-        const world = { entries:{} };
-        for (const [k,v] of Object.entries(data.entries)) {
-            world.entries[k] = structuredClone(v);
+        mergeIntoLiveBook(name, data);
+    }
+    migrateEntryFolders(name, world.data);
+    // Compare what the sidebar shows against the live book. The live book is the object
+    // SillyTavern's editor writes into, so the sidebar's own snapshot is the only fair baseline.
+    const live = world.entries;
+    const shown = world.shown;
+    const isOpenInEditor = (uid)=>currentEditor?.name == name && String(currentEditor?.uid) == uid;
+    // Redraw the open editor at most once, and only when it shows something stale.
+    let reopenUid = null;
+    const reopenEditor = (uid)=>{ reopenUid = uid; };
+    let hasStructureChange = false;
+    // removed entries
+    for (const e of Object.keys(shown)) {
+        if (Object.hasOwn(live, e)) continue;
+        world.dom.entry[e]?.root.remove();
+        delete world.dom.entry[e];
+        delete shown[e];
+        delete getWorldFolderState(name).entries[String(e)];
+        hasStructureChange = true;
+        if (isOpenInEditor(e)) {
+            currentEditor = null;
+            dom.editor.innerHTML = '';
         }
-        if (currentEditor?.name == name && dom.editor.contains(document.activeElement) && world.entries[currentEditor.uid] && cache[name].entries[currentEditor.uid]) {
-            world.entries[currentEditor.uid] = structuredClone(cache[name].entries[currentEditor.uid]);
-        }
-        let hasStructureChange = false;
-        // removed entries
-        for (const e of Object.keys(cache[name].entries)) {
-            if (world.entries[e]) continue;
-            cache[name].dom.entry[e].root.remove();
-            delete cache[name].dom.entry[e];
-            delete cache[name].entries[e];
-            delete getWorldFolderState(name).entries[String(e)];
-            hasStructureChange = true;
-            if (currentEditor?.name == name && currentEditor?.uid == e) {
-                currentEditor = null;
-                dom.editor.innerHTML = '';
-            }
-        }
-        // added entries
-        for (const e of Object.keys(world.entries)) {
-            if (cache[name].entries[e]) continue;
-            let a = world.entries[e];
-            await renderEntry(a, name);
-            hasStructureChange = true;
-        }
-        // updated entries
-        let hasUpdate = false;
-        for (const [e,o] of Object.entries(cache[name].entries)) {
-            const n = world.entries[e];
-            let hasChange = false;
-            for (const k of new Set([...Object.keys(o), ...Object.keys(n)])) {
-                if (o[k] == n[k]) continue;
-                if (typeof o[k] == 'object' && JSON.stringify(o[k]) == JSON.stringify(n[k])) continue;
-                hasChange = true;
+    }
+    // added entries
+    for (const e of Object.keys(live)) {
+        if (Object.hasOwn(shown, e) && world.dom.entry[e]) continue;
+        world.dom.entry[e]?.root.remove();
+        await renderEntry(live[e], name);
+        hasStructureChange = true;
+    }
+    // updated entries
+    let hasUpdate = false;
+    /** @type {string[]} */
+    const sortChangedUids = [];
+    for (const [e,o] of Object.entries(shown)) {
+        const n = live[e];
+        const entryDom = world.dom.entry[e];
+        let hasChange = false;
+        for (const k of new Set([...Object.keys(o), ...Object.keys(n)])) {
+            if (o[k] == n[k]) continue;
+            if (typeof o[k] == 'object' && JSON.stringify(o[k]) == JSON.stringify(n[k])) continue;
+            hasChange = true;
+            // only fields that sorting or folder grouping read need a regroup; a text edit does not
+            if (SORT_FIELDS.has(k)) {
                 hasUpdate = true;
-                switch (k) {
-                    case 'content': {
-                        if (currentEditor?.name == name && currentEditor?.uid == e && dom.editor.querySelector('[name="content"]').value != n.content) {
-                            cache[name].dom.entry[e].root.click();
-                        }
-                        break;
+                if (sortChangedUids.at(-1) !== e) sortChangedUids.push(e);
+            }
+            switch (k) {
+                case 'content': {
+                    if (isOpenInEditor(e) && dom.editor.querySelector('[name="content"]')?.value != n.content) {
+                        reopenEditor(e);
                     }
-                    case 'comment': {
-                        if (currentEditor?.name == name && currentEditor?.uid == e && dom.editor.querySelector('[name="comment"]').value != n.comment) {
-                            cache[name].dom.entry[e].root.click();
-                        }
-                        cache[name].dom.entry[e].comment.textContent = n.comment;
-                        break;
+                    break;
+                }
+                case 'comment': {
+                    if (isOpenInEditor(e) && dom.editor.querySelector('[name="comment"]')?.value != n.comment) {
+                        reopenEditor(e);
                     }
-                    case 'key': {
-                        if (hasChange && currentEditor?.name == name && currentEditor?.uid == e) {
-                            const inp = /**@type {HTMLTextAreaElement}*/(dom.editor.querySelector(`textarea[name="${k}"]`));
-                            if (!inp || inp.value != n[k].join(', ')) {
-                                cache[name].dom.entry[e].root.click();
-                            }
+                    entryDom.comment.textContent = n.comment;
+                    break;
+                }
+                case 'key': {
+                    if (isOpenInEditor(e)) {
+                        const inp = /**@type {HTMLTextAreaElement}*/(dom.editor.querySelector(`textarea[name="${k}"]`));
+                        if (!inp || inp.value != n[k].join(', ')) {
+                            reopenEditor(e);
                         }
-                        cache[name].dom.entry[e].key.textContent = n.key.join(', ');
-                        break;
                     }
-                    case 'disable': {
-                        if (hasChange && currentEditor?.name == name && currentEditor?.uid == e) {
-                            cache[name].dom.entry[e].root.click();
+                    entryDom.key.textContent = n.key.join(', ');
+                    break;
+                }
+                case 'disable': {
+                    if (isOpenInEditor(e)) {
+                        const killSwitch = dom.editor.querySelector('[name="entryKillSwitch"]');
+                        if (!killSwitch || killSwitch.classList.contains('fa-toggle-off') != !!n[k]) {
+                            reopenEditor(e);
                         }
-                        cache[name].dom.entry[e].isEnabled.classList[n[k] ? 'remove' : 'add']('fa-toggle-on');
-                        cache[name].dom.entry[e].isEnabled.classList[n[k] ? 'add' : 'remove']('fa-toggle-off');
-                        break;
                     }
-                    case 'constant':
-                    case 'vectorized': {
-                        if (hasChange && currentEditor?.name == name && currentEditor?.uid == e) {
-                            cache[name].dom.entry[e].root.click();
+                    entryDom.isEnabled.classList[n[k] ? 'remove' : 'add']('fa-toggle-on');
+                    entryDom.isEnabled.classList[n[k] ? 'add' : 'remove']('fa-toggle-off');
+                    break;
+                }
+                case 'constant':
+                case 'vectorized': {
+                    if (isOpenInEditor(e)) {
+                        const stateSelect = /**@type {HTMLSelectElement}*/(dom.editor.querySelector('select[name="entryStateSelector"]'));
+                        if (!stateSelect || stateSelect.value != entryState(n)) {
+                            reopenEditor(e);
                         }
-                        cache[name].dom.entry[e].strategy.value = entryState(n);
-                        break;
                     }
-                    default: {
-                        if (hasChange && currentEditor?.name == name && currentEditor?.uid == e) {
-                            const inp = /**@type {HTMLInputElement}*/(dom.editor.querySelector(`[name="${k}"]`));
-                            if (!inp || inp.value != n[k]) {
-                                cache[name].dom.entry[e].root.click();
-                            }
+                    entryDom.strategy.value = entryState(n);
+                    break;
+                }
+                default: {
+                    if (isOpenInEditor(e)) {
+                        const inp = /**@type {HTMLInputElement}*/(dom.editor.querySelector(`[name="${k}"]`));
+                        // A save from somewhere else changed this entry: redraw. The editor's own
+                        // saves also fill in fields it has no input for; those need no redraw.
+                        const shownValue = inp?.type == 'checkbox' ? inp.checked : inp?.value;
+                        if (!isLive || (inp && shownValue != n[k])) {
+                            reopenEditor(e);
                         }
-                        break;
                     }
+                    break;
                 }
             }
         }
-        cache[name].entries = world.entries;
-        if (hasUpdate || hasStructureChange) {
-            sortEntriesIfNeeded(name);
-        }
-        if (hasStructureChange) saveSettingsDebounced();
+        if (hasChange) shown[e] = structuredClone(n);
     }
-    updateWIChangeStarted = Promise.withResolvers();
-    updateWIChangeFinished.resolve();
+    if (reopenUid !== null && isOpenInEditor(reopenUid)) world.dom.entry[reopenUid]?.root.click();
+    if (hasUpdate || hasStructureChange) {
+        regroupBookEntries(name, { skipIfUnchanged:!hasStructureChange, changedUids:sortChangedUids });
+    }
+    if (hasStructureChange) saveSettingsDebounced();
 };
-const updateWIChangeDebounced = debounce(updateWIChange);
+/** Runs list updates one at a time, so two saves cannot interleave their DOM work. */
+let wiChangeChain = Promise.resolve();
+const updateWIChange = (name = null, data = null, eventRevision = null)=>{
+    wiChangeChain = wiChangeChain
+        .then(()=>applyWIChange(name, data, eventRevision))
+        .catch(error=>console.error('[STWID]', '[UPDATE-WI]', 'List update failed', error))
+    ;
+    return wiChangeChain;
+};
+/**
+ * Coalesce bursts of saves per book. A single shared debounce would keep only the last
+ * call, dropping another book's update (a move saves two books) or the book-list refresh.
+ * @type {Map<string|null, any>}
+ */
+const pendingWIChanges = new Map();
+const flushWIChanges = debounce(()=>{
+    const changes = [...pendingWIChanges];
+    pendingWIChanges.clear();
+    for (const [name, data] of changes) updateWIChange(name, data);
+});
+const queueWIChange = (name = null, data = null)=>{
+    pendingWIChanges.set(name, data);
+    flushWIChanges();
+};
 
-eventSource.on(event_types.WORLDINFO_UPDATED, (name, world)=>updateWIChangeDebounced(name, world, world?.[localSaveRevision] ?? null));
+eventSource.on(event_types.WORLDINFO_UPDATED, (name, data)=>{
+    if (pendingEditorSave === name && isLiveBook(name, data)) pendingEditorSave = null;
+    queueWIChange(name, data);
+});
 eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, ()=>updateSettingsChange());
 
 
@@ -1755,8 +1903,30 @@ const setSelectionDragImage = (evt)=>{
     evt.dataTransfer.setDragImage(preview, 12, 12);
     requestAnimationFrame(()=>preview.remove());
 };
+const showBookInNativeEditor = async(name)=>{
+    // Write pending editor changes first: a copy should include them, and a save that lands
+    // after a delete or rename would put the old book file back.
+    await flushEditorSave();
+    const sel = /**@type {HTMLSelectElement}*/(document.querySelector('#world_editor_select'));
+    const option = /**@type {HTMLOptionElement[]}*/([...sel.children]).find(it=>it.textContent == name);
+    if (!option) return false;
+    sel.value = option.value;
+    if (typeof worldInfoModule.showWorldEditor == 'function') {
+        // Wait until SillyTavern has bound its buttons to this book; a fixed delay could
+        // still act on the previously shown book when that one is large.
+        await worldInfoModule.showWorldEditor(name);
+    } else {
+        sel.dispatchEvent(new Event('change', { bubbles:true }));
+        await delay(500);
+    }
+    return true;
+};
 const renderBook = async(name, before = null, bookData = null)=>{
     const world = { entries:{} };
+    /** Live book object (set once the entries load); see getLiveBook. */
+    world.data = null;
+    /** Snapshot of each entry as the sidebar last drew it, used to spot changes. */
+    world.shown = {};
     world.dom = {
         /**@type {HTMLElement} */
         root: undefined,
@@ -1879,9 +2049,9 @@ const renderBook = async(name, before = null, bookData = null)=>{
                     add.title = 'New Entry';
                     add.addEventListener('click', async()=>{
                         await ensureBookLoaded(name);
-                        const data = { entries:structuredClone(cache[name].entries) };
+                        const data = getLiveBook(name);
                         const newEntry = createWorldInfoEntry(name, data);
-                        cache[name].entries[newEntry.uid] = structuredClone(newEntry);
+                        if (!newEntry) return;
                         await renderEntry(newEntry, name);
                         regroupBookEntries(name);
                         cache[name].dom.entry[newEntry.uid].root.click();
@@ -1950,11 +2120,8 @@ const renderBook = async(name, before = null, bookData = null)=>{
                                     rename.classList.add('stwid--item');
                                     rename.classList.add('stwid--rename');
                                     rename.addEventListener('click', async(evt)=>{
-                                        //TODO cheeky monkey
-                                        const sel = /**@type {HTMLSelectElement}*/(document.querySelector('#world_editor_select'));
-                                        sel.value = /**@type {HTMLOptionElement[]}*/([...sel.children]).find(it=>it.textContent == name).value;
-                                        sel.dispatchEvent(new Event('change', { bubbles:true }));
-                                        await delay(500);
+                                        //TODO cheeky monkey: drive SillyTavern's own book buttons
+                                        if (!await showBookInNativeEditor(name)) return;
                                         document.querySelector('#world_popup_name_button').click();
                                     });
                                     const i = document.createElement('i'); {
@@ -2047,11 +2214,8 @@ const renderBook = async(name, before = null, bookData = null)=>{
                                     dup.classList.add('stwid--item');
                                     dup.classList.add('stwid--duplicate');
                                     dup.addEventListener('click', async(evt)=>{
-                                        //TODO cheeky monkey
-                                        const sel = /**@type {HTMLSelectElement}*/(document.querySelector('#world_editor_select'));
-                                        sel.value = /**@type {HTMLOptionElement[]}*/([...sel.children]).find(it=>it.textContent == name).value;
-                                        sel.dispatchEvent(new Event('change', { bubbles:true }));
-                                        await delay(500);
+                                        //TODO cheeky monkey: drive SillyTavern's own book buttons
+                                        if (!await showBookInNativeEditor(name)) return;
                                         document.querySelector('#world_duplicate').click();
                                     });
                                     const i = document.createElement('i'); {
@@ -2070,11 +2234,8 @@ const renderBook = async(name, before = null, bookData = null)=>{
                                     del.classList.add('stwid--item');
                                     del.classList.add('stwid--delete');
                                     del.addEventListener('click', async(evt)=>{
-                                        //TODO cheeky monkey
-                                        const sel = /**@type {HTMLSelectElement}*/(document.querySelector('#world_editor_select'));
-                                        sel.value = /**@type {HTMLOptionElement[]}*/([...sel.children]).find(it=>it.textContent == name).value;
-                                        sel.dispatchEvent(new Event('change', { bubbles:true }));
-                                        await delay(500);
+                                        //TODO cheeky monkey: drive SillyTavern's own book buttons
+                                        if (!await showBookInNativeEditor(name)) return;
                                         document.querySelector('#world_popup_delete').click();
                                     });
                                     const i = document.createElement('i'); {
@@ -2137,6 +2298,7 @@ const renderBook = async(name, before = null, bookData = null)=>{
 };
 const renderEntry = async(e, name, before = null)=>{
     const world = cache[name];
+    world.shown[e.uid] = structuredClone(e);
     world.dom.entry[e.uid] = {};
     const entry = document.createElement('div'); {
         world.dom.entry[e.uid].root = entry;
@@ -2255,7 +2417,7 @@ const renderEntry = async(e, name, before = null)=>{
                     const dis = isEnabled.classList.toggle('fa-toggle-off');
                     isEnabled.classList.toggle('fa-toggle-on');
                     cache[name].entries[e.uid].disable = dis;
-                    await saveManagedWorldInfo(name, { entries:cache[name].entries }, true);
+                    await saveManagedWorldInfo(name, getLiveBook(name), true);
                 });
                 status.append(isEnabled);
             }
@@ -2282,7 +2444,7 @@ const renderEntry = async(e, name, before = null)=>{
                             break;
                         }
                     }
-                    await saveManagedWorldInfo(name, { entries:cache[name].entries }, true);
+                    await saveManagedWorldInfo(name, getLiveBook(name), true);
                 });
                 status.append(strat);
             }
@@ -2323,6 +2485,10 @@ const renderEntry = async(e, name, before = null)=>{
                 dom.order.toggle.click();
             }
             entry.classList.add('stwid--active');
+            // Switching to another book: write the previous book's pending edits first, or
+            // the next debounced save (for this book) would replace them in SillyTavern's queue.
+            await flushEditorSave(name);
+            if (editorRenderToken != token || clickToken != token) return;
             dom.editor.innerHTML = '';
             const unfocus = document.createElement('div'); {
                 unfocus.classList.add('stwid--unfocusToggle');
@@ -2338,7 +2504,11 @@ const renderEntry = async(e, name, before = null)=>{
             if (editorRenderToken != token || clickToken != token) return;
             dom.editor.querySelectorAll('#WIEntryHeaderTitlesPC').forEach(it=>it.remove());
             dom.editor.append(keywordHeaders);
-            const editDom = (await getWorldEntry(name, { entries:cache[name].entries }, cache[name].entries[e.uid]))[0];
+            // The editor writes straight into the live book, so the sidebar, the toggles and
+            // later saves all see its changes.
+            const liveBook = getLiveBook(name);
+            if (!liveBook?.entries?.[e.uid]) return;
+            const editDom = (await getWorldEntry(name, liveBook, liveBook.entries[e.uid]))[0];
             if (editorRenderToken != token || clickToken != token) return;
             $(editDom.querySelector('.inline-drawer')).trigger('inline-drawer-toggle');
             const focusContainer = editDom.querySelector('label[for="content "] > small > span > span'); {
@@ -2453,14 +2623,13 @@ const addDrawer = ()=>{
                         add.removeAttribute('id');
                         add.classList.add('stwid--addBook');
                         add.addEventListener('click', async()=>{
-                            const startPromise = updateWIChangeStarted.promise;
                             const tempName = getFreeWorldName();
                             const finalName = await Popup.show.input('Create a new World Info', 'Enter a name for the new file:', tempName);
                             if (finalName) {
                                 const created = await createNewWorldInfo(finalName, { interactive: true });
                                 if (created) {
-                                    await startPromise;
-                                    await updateWIChangeFinished.promise;
+                                    await updateWIChange();
+                                    if (!cache[finalName]) return;
                                     cache[finalName].dom.entryList.classList.remove('stwid--isCollapsed');
                                     cache[finalName].dom.collapseToggle.classList.add('fa-chevron-up');
                                     cache[finalName].dom.collapseToggle.classList.remove('fa-chevron-down');
@@ -2673,7 +2842,7 @@ const addDrawer = ()=>{
                                                     order += step;
                                                 }
                                                 for (const book of books) {
-                                                    await saveManagedWorldInfo(book, { entries:cache[book].entries }, true);
+                                                    await saveManagedWorldInfo(book, getLiveBook(book), true);
                                                 }
                                             });
                                             actions.append(apply);
@@ -2827,7 +2996,7 @@ const addDrawer = ()=>{
                                                                     cache[e.book].dom.entry[e.data.uid].isEnabled.classList.toggle('fa-toggle-off');
                                                                     cache[e.book].dom.entry[e.data.uid].isEnabled.classList.toggle('fa-toggle-on');
                                                                     cache[e.book].entries[e.data.uid].disable = dis;
-                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, getLiveBook(e.book), true);
                                                                 });
                                                                 active.append(isEnabled);
                                                             }
@@ -2887,7 +3056,7 @@ const addDrawer = ()=>{
                                                                             break;
                                                                         }
                                                                     }
-                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, getLiveBook(e.book), true);
                                                                 });
                                                                 strategy.append(strat);
                                                             }
@@ -2901,7 +3070,7 @@ const addDrawer = ()=>{
                                                                     const value = pos.value;
                                                                     cache[e.book].dom.entry[e.data.uid].position.value = value;
                                                                     cache[e.book].entries[e.data.uid].position = value;
-                                                                    await saveManagedWorldInfo(e.book, { entries:cache[e.book].entries }, true);
+                                                                    await saveManagedWorldInfo(e.book, getLiveBook(e.book), true);
                                                                 });
                                                                 position.append(pos);
                                                             }
@@ -3090,6 +3259,9 @@ const addDrawer = ()=>{
                 editor.addEventListener('change', ()=>{
                     if (currentEditor?.name) markLocalBookRevision(currentEditor.name);
                 }, true);
+                $(editor).on('input change', ()=>{
+                    if (currentEditor?.name) pendingEditorSave = currentEditor.name;
+                });
                 editor.addEventListener('click', async(evt)=>{
                     const transferBtn = /**@type {HTMLElement}*/(evt.target)?.closest?.('.stwip--transfer');
                     if (!transferBtn || !currentEditor) return;
@@ -3112,7 +3284,7 @@ const addDrawer = ()=>{
         }
         placeWorldInfoPresetControls();
     });
-    const moSel = new MutationObserver(()=>updateWIChangeDebounced());
+    const moSel = new MutationObserver(()=>queueWIChange());
     moSel.observe(document.querySelector('#world_editor_select'), { childList: true });
     const moDrawer = new MutationObserver(muts=>{
         if (drawerContent.getAttribute('style').includes('display: none;')) return;
